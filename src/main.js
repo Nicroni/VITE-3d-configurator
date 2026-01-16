@@ -122,12 +122,10 @@ function scheduleDecalRebuild() {
 // artwork/material
 const artworkCtrl = createArtworkController({
   onUpdate: (evt) => {
-    console.log('[onUpdate]', evt?.type, artworkCtrl.getPlacement());
-    if (!zoneMesh || !printZone) return;
-    if (!evt || evt.type === 'placement' || evt.type === 'transform') {
-      const ok = updatePoseFromPlacementUV();  // 2D -> UV -> world pose
-      console.log('  updatePoseFromPlacementUV =', ok);
-      if (ok) scheduleDecalRebuild();
+    // ✅ Scale/rotate/position — ямар ч update дээр 3D-г синкдэнэ
+    const poseOK = updatePoseFromPlacementUV(); // pose өөрчлөгдөөгүй байж болно (scale үед)
+    if (artworkCtrl.hasImage() && (decalPose || poseOK)) {
+      scheduleDecalRebuild(); // geometry-г дахин байгуулах (size/rotation өөрчлөгдөнө)
     }
   }
 });
@@ -140,42 +138,72 @@ function syncDecalWHFromPlacement() {
   const p = artworkCtrl.getPlacement();
   const img = artworkCtrl.getImage();
   if (!p || !img) return;
-  const w = p.uScale * WORLD_ZONE_W;
+  const w = p.uScale * WORLD_ZONE_W;                    // uScale = zone-ийн өргөнд харьцангуй
   const ratio = img.height / Math.max(1e-6, img.width);
   const h = w * ratio;
   decalW = Math.min(1.5, Math.max(0.05, w));
   decalH = Math.min(1.5, Math.max(0.05, h));
 }
 
+// Canvas(top->down) харьцангуй (p.u, p.v) -> absolute UV(bottom->up)
+function relToAbsUV(pu, pv, rect) {
+  const u = rect.uMin + pu * (rect.uMax - rect.uMin);
+  // 🔁 FLIP V: Canvas(top→down) -> UV(bottom→up)
+  const v = rect.vMax - pv * (rect.vMax - rect.vMin);
+  const EPS = 1e-4;
+  const uC = Math.min(1 - EPS, Math.max(EPS, u));
+  const vC = Math.min(1 - EPS, Math.max(EPS, v));
+  return new THREE.Vector2(uC, vC);
+}
+
+// Ойролцоох жижиг grid fallback (хоосон UV цэгийн үед)
+function findHitWithFallback(targetMesh, prefUV, rect) {
+  // 0) Шууд prefUV дээр
+  let hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv' });
+  if (!hit) hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv2' });
+  if (hit) return hit;
+
+  // 1) Жижиг grid (5x5), төвөөс гадагш
+  const STEPS = [0, 1, -1, 2, -2];
+  const STEP = 0.04; // printZone доторх харьцангуй алхам
+
+  // prefUV -> relative (0..1)
+  const uRel0 = (prefUV.x - printZone.uMin) / (printZone.uMax - printZone.uMin);
+  const vRel0 = (prefUV.y - printZone.vMin) / (printZone.vMax - printZone.vMin);
+
+  for (const dy of STEPS) {
+    for (const dx of STEPS) {
+      if (dx === 0 && dy === 0) continue;
+      const pu = Math.min(1, Math.max(0, uRel0 + dx * STEP));
+      const pv = Math.min(1, Math.max(0, vRel0 + dy * STEP));
+      const uv = relToAbsUV(pu, pv, rect);
+
+      let h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv' });
+      if (!h) h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv2' });
+      if (h) return h;
+    }
+  }
+  return null;
+}
 
 // 2D placement (0..1) -> absolute UV -> world pose шинэчлэх
 function updatePoseFromPlacementUV() {
-  if (!printZone) { console.log('[sync] no printZone'); return false; }
+  if (!printZone) { return false; }
 
-  // Target: эхэнд zoneMesh-ийг л ашиглая (decalPose.object null байх үе олон)
+  // Target: эхлээд zoneMesh, дараа нь decalPose.object
   const target = (zoneMesh?.isMesh ? zoneMesh : null) || (decalPose?.object?.isMesh ? decalPose.object : null);
-  if (!target) { console.warn('[sync] no target mesh with UV'); return false; }
+  if (!target) { return false; }
 
   const p = artworkCtrl.getPlacement?.();
-  if (!p) { console.log('[sync] no placement'); return false; }
+  if (!p) { return false; }
 
-  // 2D (0..1) -> absolute UV
-  let u = printZone.uMin + p.u * (printZone.uMax - printZone.uMin);
-  let v = printZone.vMin + p.v * (printZone.vMax - printZone.vMin);
+  const prefUV = relToAbsUV(p.u, p.v, printZone);
 
-  const EPS = 1e-4;
-  u = Math.min(1 - EPS, Math.max(EPS, u));
-  v = Math.min(1 - EPS, Math.max(EPS, v));
-  const uv = new THREE.Vector2(u, v);
+  // 1) uv -> 2) uv2 -> 3) grid fallback
+  let hit = pickOnMeshByUV(target, prefUV, { uvAttr: 'uv' });
+  if (!hit) hit = pickOnMeshByUV(target, prefUV, { uvAttr: 'uv2' });
+  if (!hit) hit = findHitWithFallback(target, prefUV, printZone);
 
-  // 🧩 ШУУД 2 СУВГААР ТУРШЪЯ
-  let hit = null;
-  hit = pickOnMeshByUV(target, uv, { uvAttr: 'uv' });
-  console.log('[sync] try uv : target=', target?.name, 'uv=', uv.toArray(), 'hit=', !!hit);
-  if (!hit) {
-    hit = pickOnMeshByUV(target, uv, { uvAttr: 'uv2' });
-    console.log('[sync] try uv2: target=', target?.name, 'uv=', uv.toArray(), 'hit=', !!hit);
-  }
   if (!hit) return false;
 
   const pose = buildPoseFromHit(hit);
@@ -185,9 +213,7 @@ function updatePoseFromPlacementUV() {
   return true;
 }
 
-
-
-// main.js дээр нэг удаа:
+// DevTools хурдан тест
 window.__testUVPick = () => {
   if (!zoneMesh || !printZone) return console.warn('no zoneMesh/printZone');
   const u = 0.5 * (printZone.uMin + printZone.uMax);
@@ -195,8 +221,6 @@ window.__testUVPick = () => {
   const hit = pickOnMeshByUV(zoneMesh, new THREE.Vector2(u, v));
   console.log('uv=', u.toFixed(3), v.toFixed(3), 'hit=', !!hit, hit);
 };
-
-
 
 function readSnapUI() {
   return {
@@ -309,11 +333,12 @@ function bindOverlayHandles() {
     p.uScale = Math.min(1.2, Math.max(0.05, resizeStart.uScale * sx));
     p.vScale = Math.min(1.2, Math.max(0.05, resizeStart.vScale * sy));
 
-    // ⬇️ давхардсан setPlacement-ийг нэг болголоо
+    // setPlacement нэг удаа
     artworkCtrl.setPlacement(p);
 
-    // 2D->3D sync
-    if (updatePoseFromPlacementUV()) scheduleDecalRebuild();
+    // Scale-д pose өөрчлөгдөхгүй ч decal-г заавал дахин байгуулна
+    updatePoseFromPlacementUV();
+    scheduleDecalRebuild();
   });
 
   window.addEventListener('pointerup', () => {
@@ -348,10 +373,21 @@ const editor = setupUVEditor({
 
   // 2D canvas дээрх placement шинэчлэгдсэн үед:
   onApplyDecalFromPose: () => {
-    const ok = updatePoseFromPlacementUV(); // 2D -> UV -> world pose
-    if (ok) scheduleDecalRebuild();        // throttle-тааар decal-г дахин байгуулах
+    updatePoseFromPlacementUV(); // pose байхгүй бол чимээгүй буцаана
+    scheduleDecalRebuild();      // decal-г заавал дахин байгуулах
   },
 });
+
+// (ШИНЭ) 2D талын wheel-ийг scale-д ашиглах (хүсвэл)
+artViewport?.addEventListener('wheel', (e) => {
+  if (isLocked) return;
+  if (!artworkCtrl.hasPlacement()) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const factor = e.deltaY > 0 ? 0.95 : 1.05;
+  artworkCtrl.scaleBy(factor);
+  scheduleDecalRebuild();
+}, { passive: false });
 
 btnApplyCm?.addEventListener('click', () => {
   if (isLocked) return;
@@ -505,16 +541,14 @@ canvas.addEventListener('pointerdown', (e) => {
   controls.enabled = false;
 
   artworkCtrl.placeAtUV(hit.uv, printZone);
-
   renderHUD(hit.uv);
 
-  // base pose
   const pose = buildPoseFromHit(hit);
   if (!pose) return;
   decalPose = pose;
 
   syncDecalWHFromPlacement();
-  scheduleDecalRebuild(); // applyDecalFromPose();
+  scheduleDecalRebuild();
   btnSubmit && (btnSubmit.disabled = false);
 });
 
@@ -531,7 +565,7 @@ canvas.addEventListener('pointermove', (e) => {
   if (!pose) return;
   decalPose = pose;
 
-  scheduleDecalRebuild(); // applyDecalFromPose();
+  scheduleDecalRebuild();
 });
 
 window.addEventListener('pointerup', () => {
@@ -569,7 +603,6 @@ function centerAndFitOnUpload(img, margin = 0.92) {
 }
 
 // === AUTO PLACE on 3D (after upload) ======================================
-// Камераас PRINT_ZONE_FRONT руу raycast хийж "hit" гаргана.
 function autoPlaceOnZoneCenter() {
   if (!zoneMesh || !printZone) return false;
   if (!artworkCtrl.hasImage()) return false;
@@ -598,7 +631,7 @@ function autoPlaceOnZoneCenter() {
   decalPose = pose;
 
   syncDecalWHFromPlacement();
-  scheduleDecalRebuild(); // applyDecalFromPose();
+  scheduleDecalRebuild();
 
   btnSubmit && (btnSubmit.disabled = false);
   renderHUD(hit.uv);
@@ -609,7 +642,7 @@ function autoPlaceOnZoneCenter() {
   return true;
 }
 
-// Wheel: resize artwork (edit mode)
+// Wheel: resize artwork (edit mode) — 3D canvas талд
 canvas.addEventListener('wheel', (e) => {
   if (isLocked) return;
   if (!artworkCtrl.hasPlacement()) return;
@@ -621,8 +654,7 @@ canvas.addEventListener('wheel', (e) => {
   const factor = delta > 0 ? 0.95 : 1.05;
 
   artworkCtrl.scaleBy(factor);
-  // Pose өөрчлөгдөхгүй, зөвхөн хэмжээ — decal-г дахин байгуулахад л хангалттай
-  scheduleDecalRebuild(); // applyDecalFromPose();
+  scheduleDecalRebuild();
 }, { passive: false });
 
 // Rotate
@@ -630,8 +662,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key.toLowerCase() === 'r') {
     if (isLocked) return;
     artworkCtrl.rotateByDeg(5);
-    // Pose хэвээр, зөвхөн эргэлт — decal-г дахин байгуулах
-    scheduleDecalRebuild(); // applyDecalFromPose();
+    scheduleDecalRebuild();
   }
 });
 
@@ -647,10 +678,10 @@ fileInput?.addEventListener('change', async (e) => {
   // 2D: төвд багтааж байрлуулах
   centerAndFitOnUpload(img, 0.92);
 
-  // 🧩 NEW: анхны pose-ийг UV дээрээс авах / эсвэл авто-place хийх
-  let gotPose = updatePoseFromPlacementUV();       // 2D placement -> UV -> world pose
+  // 3D: UV pick -> pose тогтоох, бүтэлгүйдвэл auto place
+  const gotPose = updatePoseFromPlacementUV(); // 2D placement -> UV -> world pose
   if (gotPose) {
-    scheduleDecalRebuild();                        // applyDecalFromPose();
+    scheduleDecalRebuild();
     hud.textContent = 'Image centered on 2D and posed on 3D (UV pick).';
   } else {
     const placed = autoPlaceOnZoneCenter();
@@ -703,4 +734,3 @@ function animate() {
   if (editor?.updateOverlayBox) editor.updateOverlayBox();
 }
 animate();
-
