@@ -20,10 +20,22 @@ export function createRenderer(container, { alpha = false } = {}) {
 }
 
 /** Resize renderer to match container bounds */
+// src/core/renderer.js
 export function resizeRendererToElement(renderer, container) {
   const rect = container.getBoundingClientRect();
-  const w = Math.max(320, rect.width);
-  const h = Math.max(240, rect.height);
-  renderer.setSize(w, h, false);
+
+  // ✅ контейнер үнэхээр хэмжээсгүй байвал алгас
+  if (rect.width < 10 || rect.height < 10) {
+    return { width: 0, height: 0 };
+  }
+
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  renderer.setPixelRatio(dpr);
+
+  const w = Math.floor(rect.width);
+  const h = Math.floor(rect.height);
+
+  renderer.setSize(w, h, false); // CSS size-г 100% дээр нь үлдээнэ
   return { width: w, height: h };
 }
+

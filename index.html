@@ -1,302 +1,133 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>UV → Print Pipeline Demo</title>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Shirt Configurator</title>
+  </head>
 
- 
+  <body>
+    <div id="app" class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo"></div>
+          <div class="title">
+            <div class="h1">3D Shirt Editor</div>
+            <div class="h2">UV Print Configurator</div>
+          </div>
+        </div>
 
-  <style>
-    :root{
-      --panel-bg: rgba(255,255,255,0.94);
-      --hud-bg: rgba(0,0,0,0.68);
-      --border: rgba(0,0,0,0.12);
-      --text: #111;
-      --muted: #6b7280;
-      --shadow: 0 10px 30px rgba(0,0,0,0.12);
-      --radius: 14px;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      overflow: hidden;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      color: var(--text);
-      user-select: none;
-      background: #f5f6f8;
-    }
+        <div class="actions">
+          <button class="iconBtn" id="btnHelp" type="button" aria-label="Help">?</button>
+          <button class="iconBtn" id="btnSettings" type="button" aria-label="Settings">⚙</button>
 
-    /* HUD (шинэчлэгдсэн) */
-    #hud {
-      position: fixed;
-      top: 12px; left: 12px;
-      background: var(--hud-bg);
-      color: #fff;
-      padding: 10px 12px;
-      border-radius: 12px;
-      white-space: pre;
-      font-size: 13px;
-      line-height: 1.35;
-      max-width: min(460px, calc(100vw - 24px));
-      z-index: 30;
-      box-shadow: var(--shadow);
-    }
-
-    /* Тохиргоо Panel */
-    #panel {
-      position: fixed;
-      top: 12px; right: 12px;
-      width: min(340px, calc(100vw - 24px));
-      background: var(--panel-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px;
-      display: grid;
-      gap: 12px;
-      z-index: 40;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(8px);
-    }
-    .panel-title{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border);
-    }
-    .panel-title b{ font-size: 14px; letter-spacing: 0.2px; }
-    .badge{
-      font-size: 12px;
-      color: var(--muted);
-      background: rgba(0,0,0,0.04);
-      border: 1px solid var(--border);
-      padding: 3px 8px;
-      border-radius: 999px;
-    }
-    .group{
-      display:grid;
-      gap: 10px;
-      padding: 10px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      background: rgba(255,255,255,0.7);
-    }
-    .group h3{ margin: 0; font-size: 13px; letter-spacing: 0.2px; }
-    .muted{ color: var(--muted); font-size: 12px; line-height: 1.35; }
-    label{
-      display:flex; align-items:center; gap: 8px; font-size: 13px;
-    }
-    input[type="checkbox"]{
-      transform: translateY(0.5px); width: 16px; height: 16px; accent-color: #111;
-    }
-    input[type="file"]{ width: 100%; font-size: 13px; }
-    input[type="number"]{
-      width: 100%; padding: 8px 10px; border-radius: 10px;
-      border: 1px solid var(--border); outline: none; font-size: 13px;
-      background: rgba(255,255,255,0.95);
-    }
-    input[type="number"]:focus{
-      border-color: rgba(0,0,0,0.35);
-      box-shadow: 0 0 0 3px rgba(0,0,0,0.06);
-    }
-    button{
-      padding: 9px 10px; border-radius: 12px; border: 1px solid var(--border);
-      background: #fff; cursor: pointer; font-size: 13px;
-      transition: transform .06s ease, background .2s ease, opacity .2s ease;
-    }
-    button:hover{ background: rgba(0,0,0,0.03); }
-    button:active{ transform: scale(0.99); }
-    button:disabled{ opacity: 0.45; cursor: not-allowed; }
-    .row{ display:flex; gap: 10px; align-items:center; }
-    .row > * { flex: 1; }
-    .row-tight{ display:flex; align-items:center; gap: 10px; }
-    .row-tight .fixed{ flex: 0 0 auto; width: 86px; color: var(--muted); font-size: 12px; }
-    .row-tight .small{ flex: 0 0 auto; width: 90px; }
-    .btn-row{ display:flex; gap: 10px; }
-    .btn-row button{ flex:1; }
-
-    /* === 2 баганат "App Shell" (Canvas + 3D) === */
-    #appShell{
-      position: fixed;
-      top: 64px;
-      left: 12px; right: 12px; bottom: 12px;
-      display: grid;
-      grid-template-columns: minmax(420px, 1fr) minmax(480px, 1fr);
-      grid-auto-rows: 1fr;
-      gap: 12px;
-      height: calc(100vh - 76px);
-    }
-    .card{
-      display:flex; flex-direction:column;
-      background: var(--panel-bg);
-      border:1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      backdrop-filter: blur(8px);
-      min-height: 0; /* grid overflow fix */
-    }
-    .card-header{
-      display:flex; align-items:center; justify-content:space-between;
-      padding: 10px 12px; border-bottom:1px solid var(--border);
-    }
-    .card-header h2{ font-size:14px; margin:0; letter-spacing:.2px; }
-    .header-actions button{ margin-left:6px; }
-
-    .editor{ display:grid; grid-template-columns: 44px 1fr; gap: 0; min-height: 300px; }
-    .vtools{
-      display:flex; flex-direction:column; gap:6px; padding:8px; border-right:1px solid var(--border);
-      background: rgba(255,255,255,0.7);
-    }
-    .vtools .tool{ width:28px; height:28px; border-radius:8px; padding:0; }
-    .vtools .tool.active{ background:rgba(0,0,0,0.06); }
-
-    .viewport{
-      position: relative; width: 100%; height: 100%;
-      overflow: auto;
-      background:
-        linear-gradient(to right, #f1f1f1 1px, transparent 1px) 0 0/20px 20px,
-        linear-gradient(to bottom,#f1f1f1 1px, transparent 1px) 0 0/20px 20px,
-        #fff;
-    }
-    #artCanvas{ display:block; margin: 16px auto; background:#fff; border:1px solid var(--border); border-radius:12px; }
-
-    .viewer3d-wrap, #viewer3d{
-      position:relative; width:100%; height:100%; min-height: 360px;
-    }
-
-    /* === Overlay (3D дээрх handle box — хэвээр) === */
-    #overlayBox{
-      position: fixed; left: 0; top: 0; width: 10px; height: 10px;
-      border: 1.5px solid rgba(17, 24, 39, 0.55);
-      border-radius: 12px; outline: 1px solid rgba(255,255,255,0.5); outline-offset: 0;
-      pointer-events: none; display: none; z-index: 50; box-shadow: 0 10px 30px rgba(0,0,0,0.10);
-      #overlayBox { backdrop-filter: none; }
-    }
-    #overlayBox::before{
-      content:""; position:absolute; inset: 0; border-radius: 12px;
-      background: linear-gradient(to right, transparent 49.5%, rgba(17,24,39,0.10) 50%, transparent 50.5%),
-                  linear-gradient(to bottom,transparent 49.5%, rgba(17,24,39,0.10) 50%, transparent 50.5%);
-      pointer-events:none; opacity: 0.35;
-    }
-    #overlayBox .h{
-      width: 12px; height: 12px; border-radius: 999px; background: #ffffff;
-      border: 2px solid rgba(17, 24, 39, 0.85); position:absolute; pointer-events: auto;
-      box-shadow: 0 8px 18px rgba(0,0,0,0.18); transform: translateZ(0);
-      transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
-    }
-    #overlayBox .h:hover{ transform: scale(1.15); box-shadow: 0 10px 22px rgba(0,0,0,0.22); background: rgba(255,255,255,0.98); }
-    #overlayBox .tl{ left:-6px; top:-6px; cursor:nwse-resize; }
-    #overlayBox .tr{ right:-6px; top:-6px; cursor:nesw-resize; }
-    #overlayBox .bl{ left:-6px; bottom:-6px; cursor:nesw-resize; }
-    #overlayBox .br{ right:-6px; bottom:-6px; cursor:nwse-resize; }
-
-    @media (max-width: 720px){
-      #panel{
-        top: auto; bottom: 12px; right: 12px; left: 12px; width: auto;
-      }
-      #appShell{
-        grid-template-columns: 1fr;
-        grid-auto-rows: auto;
-        top: 12px; bottom: 200px; /* Panel-тэй зөрөлдөхгүй */
-      }
-    }
-  </style>
-</head>
-<body>
-  <!-- HUD -->
-  <div id="hud">Loading...</div>
-
-  <!-- Config Panel -->
-  <div id="panel">
-    <div class="panel-title">
-      <b>UV Print Configurator</b>
-      <span class="badge">Shift = Snap OFF</span>
-    </div>
-
-    <!-- Placement tools -->
-    <div class="group">
-      <h3>Placement tools</h3>
-      <div class="row-tight">
-        <label><input id="chkSnapCenter" type="checkbox" checked /> Snap center</label>
-        <label><input id="chkSnapGrid" type="checkbox" /> Snap grid</label>
-        <input id="gridCm" class="small" type="number" value="1" min="0.1" step="0.1" />
-      </div>
-      <div class="row-tight">
-        <div class="fixed">Width (cm)</div>
-        <input id="inpWidthCm" type="number" min="1" step="0.1" value="25" />
-        <button id="btnApplyCm" class="small">Apply</button>
-      </div>
-      <div class="muted">
-        Tip: Drag the corner handles to resize. Wheel = scale (edit mode). R = rotate.
-      </div>
-    </div>
-
-    <!-- Artwork -->
-    <div class="group">
-      <h3>Artwork</h3>
-      <input id="file" type="file" accept="image/*" />
-      <div class="muted">Upload → click on PRINT_ZONE_FRONT to place → drag to move.</div>
-    </div>
-
-    <!-- Submit/Edit -->
-    <div class="btn-row">
-      <button id="btnSubmit">Submit (Lock)</button>
-      <button id="btnEdit" disabled>Edit</button>
-    </div>
-
-    <!-- Export -->
-    <button id="btnExport">Export PNG + JSON</button>
-  </div>
-
-  <!-- === 2 Column App Shell === -->
-  <div id="appShell">
-    <!-- Canvas Editor -->
-    <section class="card">
-      <header class="card-header">
-        <h2>Canvas Editor</h2>
-        <div class="header-actions">
-          <button id="btnZoomOut" title="Zoom Out">−</button>
-          <button id="btnZoomFit" title="Fit">⤢</button>
-          <button id="btnZoomIn" title="Zoom In">＋</button>
+          <label class="switch" title="UI toggle (optional)">
+            <input type="checkbox" id="toggleSnapHint" />
+            <span class="slider"></span>
+          </label>
         </div>
       </header>
-      <div class="editor">
-        <aside class="vtools">
-          <button class="tool active" id="toolMove" title="Move (default)">🖱️</button>
-          <button class="tool" id="toolRotateL" title="Rotate Left (E)">⤺</button>
-          <button class="tool" id="toolRotateR" title="Rotate Right (R)">⤻</button>
-          <button class="tool" id="toolCenter" title="Center">◎</button>
+
+      <main class="content">
+        <!-- Left: 2D -->
+        <section class="panel card" id="leftPanel">
+          <div class="cardHeader">
+            <div class="cardTitle">2D Design Placement</div>
+            <div class="chip" id="zoneLabel">Print Zone: 30 × 40 cm</div>
+            <div class="spacer"></div>
+            <div class="toolbar">
+              <button class="toolBtn" id="btnZoomOut" type="button">−</button>
+              <button class="toolBtn" id="btnFit" type="button">⤢</button>
+              <button class="toolBtn" id="btnZoomIn" type="button">+</button>
+            </div>
+          </div>
+
+          <div class="cardBody">
+            <div class="canvasShell" id="artViewport">
+              <canvas id="artCanvas"></canvas>
+
+              <!-- ✅ overlayBox-оо 2D дээр байлга (3D-г өнгөөр таглахгүй) -->
+              <div id="overlayBox" class="overlayBox">
+                <div class="handle tl"></div>
+                <div class="handle tr"></div>
+                <div class="handle bl"></div>
+                <div class="handle br"></div>
+              </div>
+            </div>
+
+            <pre class="hud" id="hud"></pre>
+          </div>
+        </section>
+
+        <!-- Right: 3D -->
+        <section class="panel card" id="rightPanel">
+          <div class="cardHeader">
+            <div class="cardTitle">3D Preview</div>
+            <div class="spacer"></div>
+            <div class="pill" id="modePill">EDIT</div>
+          </div>
+
+          <div class="cardBody">
+            <div class="viewerShell" id="viewer3d"></div>
+          </div>
+        </section>
+
+        <!-- Tools -->
+        <aside class="tools card" id="toolsPanel">
+          <div class="cardHeader">
+            <div class="cardTitle">Placement Tools</div>
+            <div class="spacer"></div>
+            <div class="chip">Shift = Snap OFF</div>
+          </div>
+
+          <div class="cardBody">
+            <div class="fieldRow">
+              <label class="check">
+                <input type="checkbox" id="chkSnapCenter" checked />
+                <span>Snap center</span>
+              </label>
+
+              <label class="check">
+                <input type="checkbox" id="chkSnapGrid" />
+                <span>Snap grid</span>
+              </label>
+
+              <div class="miniInput">
+                <span>cm</span>
+                <input id="gridCm" type="number" value="1" min="0" step="0.5" />
+              </div>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="fieldRow">
+              <label class="label">Width (cm)</label>
+              <input id="inpWidthCm" type="number" value="24.7" step="0.1" />
+              <button class="btn" id="btnApplyCm" type="button">Apply</button>
+            </div>
+
+            <p class="hint">
+              Tip: Drag corner handles to resize. Wheel = scale (edit mode). R = rotate.
+            </p>
+
+            <div class="divider"></div>
+
+            <div class="sectionTitle">Artwork</div>
+            <div class="fieldRow">
+              <input id="file" type="file" accept="image/*" />
+            </div>
+
+            <div class="fieldCol">
+              <button class="btn ghost" id="btnEdit" type="button">Edit in 2D</button>
+              <button class="btn primary" id="btnSubmit" type="button">Submit (Lock)</button>
+              <button class="btn primary2" id="btnExport" type="button">Export PNG + JSON</button>
+            </div>
+          </div>
         </aside>
-        <div class="viewport" id="artViewport">
-          <canvas id="artCanvas" width="900" height="1200"></canvas>
-        </div>
-      </div>
-    </section>
+      </main>
+    </div>
 
-    <!-- 3D Preview -->
-    <section class="card">
-      <header class="card-header">
-        <h2>3D Preview</h2>
-      </header>
-      <div class="viewer3d-wrap">
-        <div id="viewer3d"></div>
-      </div>
-    </section>
-  </div>
-
-  <!-- Overlay (3D resize handles) -->
-  <div id="overlayBox">
-    <div class="h tl"></div>
-    <div class="h tr"></div>
-    <div class="h bl"></div>
-    <div class="h br"></div>
-  </div>
-
-  <script type="module" src="/src/main.js"></script>
-</body>
+    <!-- ✅ Vite entry -->
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>
-

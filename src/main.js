@@ -1,9 +1,10 @@
 
 // src/main.js
-console.log('[BOOT] main.js loaded', import.meta.url);
+//console.log('[BOOT] main.js loaded', import.meta.url);
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import './styless.css';
 
 import { initScene, getContext } from './core/scene.js';
 import { createRenderer, resizeRendererToElement } from './core/renderer.js';
@@ -63,17 +64,63 @@ initScene({
   aspect: viewer3d.clientWidth / Math.max(1, viewer3d.clientHeight),
 });
 
+
+let _modelBox = null;     // Box3 cache
+let _modelSize = null;    // Vector3 cache
+let _modelCenter = null;  // Vector3 cache
+
+function fitCameraToModel(framing = 1.35) {
+  if (!_modelBox || !_modelSize) return;
+
+  // Хэрвээ чи tshirtRoot.position.sub(_modelCenter) хийсэн бол
+  // model-ийн төв нь (0,0,0) болсон гэсэн үг.
+  const center = new THREE.Vector3(0, 0, 0);
+
+  const maxDim = Math.max(_modelSize.x, _modelSize.y, _modelSize.z);
+
+  // Fit distance (vertical + horizontal)
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const fitHeightDistance = (maxDim / 2) / Math.tan(fov / 2);
+  const fitWidthDistance = fitHeightDistance / Math.max(1e-6, camera.aspect);
+
+  const dist = framing * Math.max(fitHeightDistance, fitWidthDistance);
+
+  // Камерыг model-ийн яг төв рүү харуулна
+  controls.target.copy(center);
+
+  // Камерыг төвөөс арагш байрлуулна (z тэнхлэгээр)
+  camera.position.set(center.x, center.y, center.z + dist);
+
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far  = dist * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+
 const { scene, camera } = getContext();
 
 const { renderer, canvas } = createRenderer(viewer3d, { alpha: false });
 function handleResize() {
-  resizeRendererToElement(renderer, viewer3d);
   const rect = viewer3d.getBoundingClientRect();
+  if (rect.width < 10 || rect.height < 10) return;
+  resizeRendererToElement(renderer, viewer3d);
   camera.aspect = rect.width / Math.max(1, rect.height);
   camera.updateProjectionMatrix();
+
+  // ✅ model бэлэн + хэмжээс OK үед л fit хийнэ
+ if (_modelBox && _modelSize && _modelCenter) {
+    fitCameraToModel(1.35);
+  }
+
 }
+
 handleResize();
 window.addEventListener('resize', handleResize);
+// ✅ viewer3d-ийн хэмжээ layout-оос болж өөрчлөгдөх үед ч автоматаар resize хийх
+const ro = new ResizeObserver(() => handleResize());
+ro.observe(viewer3d);
+
 
 // (optional) color space / pixel ratio
 if ('outputColorSpace' in renderer) {
@@ -92,6 +139,8 @@ setControlMode('EDIT'); // EDIT үед wheel-ийг artwork scale-д ашигл�
 let tshirtRoot = null;
 let zoneMesh = null;
 let printZone = null;
+let WORLD_ZONE_W_DYNAMIC = WORLD_ZONE_W; // fallback (constants.js-оос)
+
 
 let decalMesh = null;
 let decalPose = null; // { object, position, baseOrientation }
@@ -138,7 +187,7 @@ function syncDecalWHFromPlacement() {
   const p = artworkCtrl.getPlacement();
   const img = artworkCtrl.getImage();
   if (!p || !img) return;
-  const w = p.uScale * WORLD_ZONE_W;                    // uScale = zone-ийн өргөнд харьцангуй
+ const w = p.uScale * WORLD_ZONE_W_DYNAMIC;   // ✅ энд л ашиглана
   const ratio = img.height / Math.max(1e-6, img.width);
   const h = w * ratio;
   decalW = Math.min(1.5, Math.max(0.05, w));
@@ -429,6 +478,8 @@ btnEdit?.addEventListener('click', () => {
   setLockedState(false);
 });
 
+
+
 // --------------------
 // Load GLB
 // --------------------
@@ -438,29 +489,35 @@ loader.load(
   (gltf) => {
     tshirtRoot = gltf.scene;
     scene.add(tshirtRoot);
+    // Fit camera to model (cache + fit)
+_modelBox = new THREE.Box3().setFromObject(tshirtRoot);
+_modelSize = _modelBox.getSize(new THREE.Vector3());
+_modelCenter = _modelBox.getCenter(new THREE.Vector3());
 
-    // Fit camera to model
-    const box = new THREE.Box3().setFromObject(tshirtRoot);
-    const center = box.getCenter(new THREE.Vector3());
-    tshirtRoot.position.sub(center);
+tshirtRoot.position.sub(_modelCenter);
 
-    const newBox = new THREE.Box3().setFromObject(tshirtRoot);
-    const newSize = newBox.getSize(new THREE.Vector3());
-    const maxDim = Math.max(newSize.x, newSize.y, newSize.z);
-    const fov = THREE.MathUtils.degToRad(camera.fov);
-    let cameraZ = (maxDim / 2) / Math.tan(fov / 2);
-    cameraZ *= 1.6;
+// aspect аль хэдийн handleResize дээр шинэчлэгддэг тул
+//fitCameraToModel(1.6);
+fitCameraToModel(1.35);
+handleResize(); // ✅ aspect + size update + if(_modelBox) fit
 
-    camera.position.set(0, maxDim * 0.6, cameraZ);
-    camera.near = Math.max(0.01, cameraZ / 100);
-    camera.far = cameraZ * 100;
-    camera.updateProjectionMatrix();
-    controls.target.set(0, 0, 0);
+
+    
 
     // --- find zone ---
     let foundZone = null;
     tshirtRoot.traverse(o => { if (o.name === 'PRINT_ZONE_FRONT') foundZone = o; });
     zoneMesh = foundZone;
+    // after zoneMesh found
+if (zoneMesh && zoneMesh.isObject3D) {
+  const zoneBox = new THREE.Box3().setFromObject(zoneMesh);
+  const zoneSize = zoneBox.getSize(new THREE.Vector3());
+  WORLD_ZONE_W_DYNAMIC = Math.max(1e-6, zoneSize.x);
+  console.log('[zone] WORLD_ZONE_W_DYNAMIC =', WORLD_ZONE_W_DYNAMIC.toFixed(4));
+} else {
+  console.warn('[zone] PRINT_ZONE_FRONT not found → using fallback WORLD_ZONE_W');
+}
+
 
     // 🔎 Debug: бүх хүүхэд mesh-үүд, UV байгаа эсэх
     console.group('[zone] scan');
@@ -643,19 +700,22 @@ function autoPlaceOnZoneCenter() {
 }
 
 // Wheel: resize artwork (edit mode) — 3D canvas талд
-canvas.addEventListener('wheel', (e) => {
+viewer3d.addEventListener('wheel', (e) => {
+  // ✅ Page scroll хэвээр үлдээнэ. Зөвхөн Alt (эсвэл Shift)-тай үед л scale.
+  const scaleIntent = e.altKey || e.shiftKey;
+  if (!scaleIntent) return;
+
   if (isLocked) return;
   if (!artworkCtrl.hasPlacement()) return;
 
   e.preventDefault();
   e.stopPropagation();
 
-  const delta = Math.sign(e.deltaY);
-  const factor = delta > 0 ? 0.95 : 1.05;
-
+  const factor = e.deltaY > 0 ? 0.95 : 1.05;
   artworkCtrl.scaleBy(factor);
   scheduleDecalRebuild();
 }, { passive: false });
+
 
 // Rotate
 window.addEventListener('keydown', (e) => {

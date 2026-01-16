@@ -192,93 +192,185 @@ export function setupUVEditor(opts) {
   }
 
   // === Editor events ===
-  function bindEditorEvents() {
-    function placeFromClient(e) {
-      const loc = clientToLocal(e);
-      const inv = 1 / edScale;
-      const x = (loc.x - edPan.x) * inv;
-      const y = (loc.y - edPan.y) * inv;
+ // === Editor events ===
+function bindEditorEvents() {
+  // --- 2D drag state (✅ нэг газар shared state) ---
+  let isDragging2D = false;
+  let grabOffsetU = 0;
+  let grabOffsetV = 0;
 
-      const p = artworkCtrl.getPlacement() || { u: 0.5, v: 0.5, uScale: 0.3, vScale: 0.3, rotationRad: 0 };
-      p.u = Math.min(1, Math.max(0, x / artCanvas.width));
-      p.v = Math.min(1, Math.max(0, 1 - (y / artCanvas.height)));
+  function getUVFromEvent(e) {
+    // event -> canvas local (CSS px)
+    const loc = clientToLocal(e);
 
-      const sn = readSnapUI();
-      const snapped = applySnap(p, {
-        enableCenterSnap: sn.enableCenter,
-        enableGridSnap: sn.enableGrid,
-        gridCm: sn.gridCm,
-        printZoneCM,
-        shiftToDisable: true,
-        shiftKey: e.shiftKey,
-      });
+    // pan/zoom-г тайлж "canvas coordinate" (px) болгож хөрвүүлэх
+    const inv = 1 / edScale;
+    const x = (loc.x - edPan.x) * inv;
+    const y = (loc.y - edPan.y) * inv;
 
-      artworkCtrl.setPlacement(snapped);
-      onApplyDecalFromPose();     // 3D синк
-      drawEditor();
+    // canvas px -> normalized u,v
+    let u = x / artCanvas.width;
+    let v = 1 - (y / artCanvas.height);
+
+    // clamp
+    u = Math.min(1, Math.max(0, u));
+    v = Math.min(1, Math.max(0, v));
+    return { u, v };
+  }
+
+  function applySnapAndSet(p, e) {
+    const sn = readSnapUI();
+    const snapped = applySnap(p, {
+      enableCenterSnap: sn.enableCenter,
+      enableGridSnap: sn.enableGrid,
+      gridCm: sn.gridCm,
+      printZoneCM,
+      shiftToDisable: true,
+      shiftKey: e.shiftKey,
+    });
+    artworkCtrl.setPlacement(snapped);
+  }
+
+  function placeFromClient(e) {
+    const { u, v } = getUVFromEvent(e);
+
+    const p =
+      artworkCtrl.getPlacement() ||
+      { u: 0.5, v: 0.5, uScale: 0.3, vScale: 0.3, rotationRad: 0 };
+
+    p.u = u;
+    p.v = v;
+
+    applySnapAndSet(p, e);
+    onApplyDecalFromPose();
+    drawEditor();
+  }
+
+  function stopDrag(e) {
+    isDragging2D = false;
+    edDragging = false;
+    edPanning = false;
+
+    if (e?.pointerId != null) {
+      try { artCanvas.releasePointerCapture(e.pointerId); } catch {}
+    }
+  }
+
+  // -----------------------
+  // pointerdown
+  // -----------------------
+  artCanvas?.addEventListener('pointerdown', (e) => {
+    if (!artworkCtrl.hasImage()) return;
+
+    // ✅ pointerup алдагдахаас хамгаална
+    artCanvas.setPointerCapture(e.pointerId);
+
+    // pan mode (space / middle / right)
+    if (spaceHeld || e.button === 1 || e.button === 2) {
+      edPanning = true;
+      e.preventDefault();
+      return;
     }
 
-    artCanvas?.addEventListener('pointerdown', (e) => {
-      if (!artworkCtrl.hasImage()) return;
-      artCanvas.setPointerCapture(e.pointerId);
-      if (spaceHeld || e.button === 1 || e.button === 2) {
-        edPanning = true;
-      } else {
-        edDragging = true;
-        placeFromClient(e);
-      }
-    });
+    // ---- LEFT CLICK ----
+    // 1) хэрэв placement байхгүй бол: нэг удаа байрлуулна
+    if (!artworkCtrl.hasPlacement()) {
+      edDragging = true;
+      placeFromClient(e); // click placement
+      // drag эхлүүлэхгүй (байрлуулж дуусаад зогсоно)
+      stopDrag(e);
+      return;
+    }
 
-    artCanvas?.addEventListener('pointermove', (e) => {
-      if (edPanning) {
-        e.preventDefault();
-        edPan.x += e.movementX;
-        edPan.y += e.movementY;
-        drawEditor();
-        return;
-      }
-      if (edDragging) {
-        placeFromClient(e);
-      }
-    });
+    // 2) placement байгаа бол: "drag to move"
+    const { u, v } = getUVFromEvent(e);
+    const p = artworkCtrl.getPlacement();
 
-    window.addEventListener('pointerup', () => { edDragging = false; edPanning = false; });
+    // ✅ mouse дарсан цэг төвөөс хэдэн u/v зөрүүтэйг хадгална
+    grabOffsetU = u - p.u;
+    grabOffsetV = v - p.v;
 
-    // Wheel = zoom to cursor
-    artCanvas?.addEventListener('wheel', (e) => {
+    isDragging2D = true;
+    edDragging = true;
+
+    e.preventDefault();
+  });
+
+  // -----------------------
+  // pointermove
+  // -----------------------
+  window.addEventListener('pointermove', (e) => {
+    // ✅ товч суллагдсан мөртлөө move ирвэл drag-аа унтраана
+    if (isDragging2D && e.buttons === 0) {
+      stopDrag(e);
+      return;
+    }
+
+    if (edPanning) {
       e.preventDefault();
-      const rect = artCanvas.getBoundingClientRect();
-      const loc = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-      const old = edScale;
-      const k = (e.deltaY > 0) ? 0.9 : 1.1;
-      edScale = Math.max(0.2, Math.min(5, edScale * k));
-
-      const wx = (loc.x - edPan.x) / old;
-      const wy = (loc.y - edPan.y) / old;
-      edPan.x = loc.x - wx * edScale;
-      edPan.y = loc.y - wy * edScale;
-
+      edPan.x += e.movementX;
+      edPan.y += e.movementY;
       drawEditor();
-    }, { passive: false });
+      return;
+    }
 
-    // Keyboard: space = pan, E/R rotate
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space') spaceHeld = true;
-      if (artworkCtrl.hasPlacement()) {
-        if (e.key.toLowerCase() === 'e') {
-          artworkCtrl.rotateByDeg(-5); onApplyDecalFromPose(); drawEditor();
-        }
-        if (e.key.toLowerCase() === 'r') {
-          artworkCtrl.rotateByDeg(5); onApplyDecalFromPose(); drawEditor();
-        }
-      }
-    });
-    window.addEventListener('keyup', (e) => { if (e.code === 'Space') spaceHeld = false; });
+    if (!isDragging2D) return;
 
-    // Initial + responsive
-    resizeCanvasDPR();
-    window.addEventListener('resize', () => { resizeCanvasDPR(); drawEditor(); });
-  }
+    const { u, v } = getUVFromEvent(e);
+    const p = artworkCtrl.getPlacement();
+    if (!p) return;
+
+    p.u = u - grabOffsetU;
+    p.v = v - grabOffsetV;
+
+    // clamp
+    p.u = Math.min(1, Math.max(0, p.u));
+    p.v = Math.min(1, Math.max(0, p.v));
+
+    applySnapAndSet(p, e);
+    onApplyDecalFromPose();
+    drawEditor();
+  });
+
+  // -----------------------
+  // pointerup/cancel
+  // -----------------------
+  window.addEventListener('pointerup', (e) => stopDrag(e));
+  window.addEventListener('pointercancel', (e) => stopDrag(e));
+  window.addEventListener('blur', () => { isDragging2D = false; edDragging = false; edPanning = false; });
+
+  // Wheel = zoom to cursor
+  artCanvas?.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = artCanvas.getBoundingClientRect();
+    const loc = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const old = edScale;
+    const k = (e.deltaY > 0) ? 0.9 : 1.1;
+    edScale = Math.max(0.2, Math.min(5, edScale * k));
+
+    const wx = (loc.x - edPan.x) / old;
+    const wy = (loc.y - edPan.y) / old;
+    edPan.x = loc.x - wx * edScale;
+    edPan.y = loc.y - wy * edScale;
+
+    drawEditor();
+  }, { passive: false });
+
+  // Keyboard: space = pan, E/R rotate
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') spaceHeld = true;
+    if (artworkCtrl.hasPlacement()) {
+      if (e.key.toLowerCase() === 'e') { artworkCtrl.rotateByDeg(-5); onApplyDecalFromPose(); drawEditor(); }
+      if (e.key.toLowerCase() === 'r') { artworkCtrl.rotateByDeg( 5); onApplyDecalFromPose(); drawEditor(); }
+    }
+  });
+  window.addEventListener('keyup', (e) => { if (e.code === 'Space') spaceHeld = false; });
+
+  // Initial + responsive
+  resizeCanvasDPR();
+  window.addEventListener('resize', () => { resizeCanvasDPR(); drawEditor(); });
+}
+
 
   bindEditorEvents();
 
