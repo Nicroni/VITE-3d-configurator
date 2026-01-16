@@ -1,0 +1,73 @@
+export function makeArtworkController({ onUpdate }) {
+  let image = null;
+
+  // placement нь printZone дотор normalised (0..1)
+  let placement = null;
+
+  function emit() {
+    onUpdate?.(placement ? { ...placement } : null);
+  }
+
+  function clamp(x, a, b) { return Math.min(b, Math.max(a, x)); }
+
+  return {
+    setImage(img) {
+      image = img;
+
+      placement = {
+        u: 0.5, v: 0.5,
+        uScale: 0.35,
+        vScale: 0.35 * (img.height / img.width),
+        rotationRad: 0
+      };
+      emit();
+    },
+
+    setPlacement(p) {
+      if (!p || !placement) return;
+      placement.u = p.u; placement.v = p.v;
+      placement.uScale = p.uScale; placement.vScale = p.vScale;
+      placement.rotationRad = p.rotationRad;
+      emit();
+    },
+
+    getImage() { return image; },
+    hasImage() { return !!image; },
+    hasPlacement() { return !!placement && !!image; },
+
+    placeAtUV(hitUV, zoneUV) {
+      const u = (hitUV.x - zoneUV.uMin) / (zoneUV.uMax - zoneUV.uMin);
+      const v = (hitUV.y - zoneUV.vMin) / (zoneUV.vMax - zoneUV.vMin);
+
+      placement.u = clamp(u, 0, 1);
+      placement.v = clamp(v, 0, 1);
+      emit();
+    },
+
+    scaleBy(factor) {
+      placement.uScale = clamp(placement.uScale * factor, 0.05, 1.2);
+      placement.vScale = clamp(placement.vScale * factor, 0.05, 1.2);
+      emit();
+    },
+
+    rotateByDeg(deg) {
+      placement.rotationRad += (deg * Math.PI) / 180;
+      emit();
+    },
+
+    getPlacement() { return placement ? { ...placement } : null; }
+  };
+}
+
+// --- Helper to bake artwork into template and produce PNG + JSON data
+export function generatePrintData({ product, printZone, placement, artworkImage, dpi, templatePx }) {
+  return bakeTemplatePNGAndJSON({
+    artworkImage,
+    placement,
+    printZone,
+    printZoneCM: product.printZonesCM[printZone.name],
+    dpi,
+    templatePx,
+    product
+  });
+}

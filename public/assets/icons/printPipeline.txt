@@ -1,0 +1,114 @@
+// 1) PRINT_ZONE_FRONT mesh-ээс UV bounding box гаргана
+export function buildPrintZoneFromMesh(zoneMesh) {
+  // zoneMesh.geometry.attributes.uv байх ёстой
+  const uvAttr = zoneMesh.geometry.attributes.uv;
+  if (!uvAttr) throw new Error("PRINT_ZONE mesh has no UVs.");
+
+  let uMin = Infinity, vMin = Infinity;
+  let uMax = -Infinity, vMax = -Infinity;
+
+  for (let i = 0; i < uvAttr.count; i++) {
+    const u = uvAttr.getX(i);
+    const v = uvAttr.getY(i);
+    uMin = Math.min(uMin, u); uMax = Math.max(uMax, u);
+    vMin = Math.min(vMin, v); vMax = Math.max(vMax, v);
+  }
+
+  return {
+    uMin, uMax, vMin, vMax,
+    name: zoneMesh.name,
+    side: "front"
+  };
+}
+
+// 2) Хэрэглэгчийн дарсан UV -> cm (printZoneCM дотор)
+export function uvToPrintCM(hitUV, zoneUV, zoneCM) {
+  const uNorm = (hitUV.x - zoneUV.uMin) / (zoneUV.uMax - zoneUV.uMin);
+  const vNorm = (hitUV.y - zoneUV.vMin) / (zoneUV.vMax - zoneUV.vMin);
+
+  // y-г дээдээс доош гэж стандартчилъя (ихэнх хэвлэлт дээр ингэж ойлгоход амар)
+  return {
+    x_cm: uNorm * zoneCM.width,
+    y_cm: (1 - vNorm) * zoneCM.height
+  };
+}
+
+// 3) Artwork placement (zone-normalised) -> template canvas дээр зураг буулгах
+export async function bakeTemplatePNGAndJSON({
+  artworkImage,
+  placement,      // {u,v,uScale,vScale,rotationRad} within zone
+  printZone,      // {uMin,uMax,vMin,vMax}
+  printZoneCM,    // {width,height} in cm
+  dpi,
+  templatePx,     // e.g. 4096
+  product         // {id,side}
+}) {
+  // --- Canvas setup
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = templatePx;
+  const ctx = canvas.getContext("2d");
+
+  // clear transparent
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // --- Convert placement to UV in full UV space
+  const u = lerp(printZone.uMin, printZone.uMax, placement.u);
+  const v = lerp(printZone.vMin, printZone.vMax, placement.v);
+
+  const uSize = (printZone.uMax - printZone.uMin) * placement.uScale;
+  const vSize = (printZone.vMax - printZone.vMin) * placement.vScale;
+
+  // --- UV -> Pixel
+  const centerX = u * templatePx;
+  const centerY = (1 - v) * templatePx;     // V invert for canvas
+
+  const drawW = uSize * templatePx;
+  const drawH = vSize * templatePx;
+
+  // --- Draw with rotation about center
+  ctx.save();
+  ctx.translate(centerX, centerY);
+  ctx.rotate(placement.rotationRad);
+  ctx.drawImage(artworkImage, -drawW / 2, -drawH / 2, drawW, drawH);
+  ctx.restore();
+
+  // --- Compute cm placement (within print zone)
+  // placement.u/v is already zone-normalised
+  const x_cm = placement.u * printZoneCM.width;
+  const y_cm = (1 - placement.v) * printZoneCM.height;
+
+  const w_cm = placement.uScale * printZoneCM.width;
+  const h_cm = placement.vScale * printZoneCM.height;
+
+  // --- Optionally compute pixel placement for printing
+  const pxPerCm = dpi / 2.54;
+  const w_px = w_cm * pxPerCm;
+  const h_px = h_cm * pxPerCm;
+
+  const json = {
+    product: product.id,
+    side: product.side,
+    dpi,
+    templatePx,
+    printZoneCM,
+    placement: {
+      x_cm: round2(x_cm),
+      y_cm: round2(y_cm),
+      width_cm: round2(w_cm),
+      height_cm: round2(h_cm),
+      rotation_deg: round2((placement.rotationRad * 180) / Math.PI)
+    },
+    placement_pixels_at_dpi: {
+      width_px: Math.round(w_px),
+      height_px: Math.round(h_px)
+    }
+  };
+
+  return {
+    pngDataURL: canvas.toDataURL("image/png"),
+    json
+  };
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function round2(x) { return Math.round(x * 100) / 100; }
