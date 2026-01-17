@@ -119,6 +119,26 @@ body{margin:0;font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Ro
   height: 100%;
 }
 
+.uvTabs{
+  display:flex;
+  gap:8px;
+  padding:10px 12px;
+  border-bottom:1px solid rgba(0,0,0,.06);
+}
+.uvTab{
+  border:1px solid rgba(0,0,0,.10);
+  background:#fff;
+  padding:8px 12px;
+  border-radius:999px;
+  cursor:pointer;
+  font-weight:600;
+}
+.uvTab.is-active{
+  background:#0ea5a5;
+  color:#fff;
+  border-color:transparent;
+}
+
 
 .hud{
   margin-top:12px;

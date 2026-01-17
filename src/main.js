@@ -54,6 +54,8 @@ const gridCmInput = document.getElementById('gridCm');
 const inpWidthCm = document.getElementById('inpWidthCm');
 const btnApplyCm = document.getElementById('btnApplyCm');
 
+const uvTabs = document.getElementById('uvTabs');
+
 const viewer3d = document.getElementById('viewer3d');
 if (!viewer3d) throw new Error('#viewer3d not found');
 
@@ -137,6 +139,35 @@ const ZONE_MESH_NAMES = {
   right_arm: 'PRINT_ZONE_RIGHT_ARM',
 };
 
+const zoneDrafts = {
+  front:     { image: null, placement: null, locked: false },
+  back:      { image: null, placement: null, locked: false },
+  left_arm:  { image: null, placement: null, locked: false },
+  right_arm: { image: null, placement: null, locked: false },
+};
+
+function saveDraftFor(key) {
+  if (!key) return;
+  const d = zoneDrafts[key];
+  if (!d) return;
+  d.image = artworkCtrl.getImage?.() || null;
+  d.placement = artworkCtrl.getPlacement?.() ? { ...artworkCtrl.getPlacement() } : null;
+}
+
+function restoreDraftFor(key) {
+  const d = zoneDrafts[key];
+  if (!d) return;
+
+  // restore image + placement into controller
+  artworkCtrl.setImage(d.image || null);
+  artworkCtrl.setPlacement(d.placement ? { ...d.placement } : null);
+
+  // update 3D material texture to match this zone's image
+  if (d.image) {
+    setArtworkTextureFromImage(d.image, decalMat, renderer, { flipU: true });
+  }
+}
+
 let tshirtRoot = null;
 
 let zones = {};              // { front:{uMin..}, back:{..} ... }
@@ -149,9 +180,10 @@ let WORLD_ZONE_W_DYNAMIC = WORLD_ZONE_W;
 
 let isDragging = false;
 
-// ✅ per-zone lock (submit хийсэн талыг дахин хөдөлгөхгүй болгоно)
-const zoneLocks = { front: false, back: false, left_arm: false, right_arm: false };
-function isLocked() { return !!zoneLocks[activeZoneKey]; }
+
+
+
+
 
 // decal per zone
 const zoneDecals = {
@@ -195,6 +227,22 @@ const artworkCtrl = createArtworkController({
 // --------------------
 // Helpers
 // --------------------
+
+function setActiveTabUI(key) {
+  uvTabs?.querySelectorAll('.uvTab').forEach(b => {
+    b.classList.toggle('is-active', b.dataset.zone === key);
+  });
+}
+
+uvTabs?.addEventListener('click', (e) => {
+  const btn = e.target.closest('.uvTab');
+  if (!btn) return;
+  const key = btn.dataset.zone;
+  setActiveZone(key);
+  setActiveTabUI(key);
+});
+
+
 function ensureZoneDecal(key) {
   if (!zoneDecals[key]) {
     zoneDecals[key] = {
@@ -262,13 +310,15 @@ function syncDecalWHFromPlacement() {
 // placement (zone-local) -> abs UV (v flip)
 function relToAbsUV(pu, pv, rect) {
   const u = rect.uMin + pu * (rect.uMax - rect.uMin);
-  const v = rect.vMax - pv * (rect.vMax - rect.vMin);
+  const v = rect.vMin + pv * (rect.vMax - rect.vMin);
 
   const EPS = 1e-4;
-  const uC = Math.min(1 - EPS, Math.max(EPS, u));
-  const vC = Math.min(1 - EPS, Math.max(EPS, v));
-  return new THREE.Vector2(uC, vC);
+  return new THREE.Vector2(
+    Math.min(1 - EPS, Math.max(EPS, u)),
+    Math.min(1 - EPS, Math.max(EPS, v))
+  );
 }
+
 
 function findHitWithFallback(targetMesh, prefUV) {
   let hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv' });
@@ -373,93 +423,107 @@ Zone: ${activeZoneKey} | ${isLocked() ? 'LOCKED' : 'EDIT'}`;
 // --------------------
 // Lock / Edit (per-zone)
 // --------------------
+// --------------------
+// Lock / Edit (per-zone via zoneDrafts.locked)
+// --------------------
+function isZoneLocked(key) {
+  return !!zoneDrafts?.[key]?.locked;
+}
+function isLocked() {
+  return isZoneLocked(activeZoneKey);
+}
+
 function syncLockUI() {
   const locked = isLocked();
   setControlMode(locked ? 'LOCKED' : 'EDIT');
-
   if (btnSubmit) btnSubmit.disabled = locked;
   if (btnEdit) btnEdit.disabled = !locked;
 }
 
+function setLockedStateForZone(key, lock) {
+  if (!zoneDrafts?.[key]) return;
+  zoneDrafts[key].locked = !!lock;
+  syncLockUI();
+}
+
+
 btnSubmit?.addEventListener('click', () => {
-  // ✅ Submit = тухайн zone-ийн зураг/placement/pose-г хадгалаад,
-  // дараагийн зураг оруулахад бэлэн болгож artworkCtrl-оо цэвэрлэнэ.
-  if (!artworkCtrl.hasImage() || !artworkCtrl.hasPlacement()) {
-    alert('Upload + Place artwork first.');
+  const d = zoneDrafts[activeZoneKey];
+  const zs = ensureZoneDecal(activeZoneKey);
+
+  // draft дээр image+placement байх ёстой
+  if (!d?.image || !d?.placement) {
+    alert('Upload + place artwork first.');
     return;
   }
 
-  const zs = ensureZoneDecal(activeZoneKey);
-
-  // pose баталгаажуулах
+  // pose баталгаажуулна (заримдаа tab солиход pose null болдог)
   const poseOK = updatePoseFromPlacementUV();
   if (!poseOK || !zs.pose) {
     alert('Pose not ready. Click on the 3D zone once to place.');
     return;
   }
 
-  // тухайн zone-ийн snapshot хадгална
-  zs.image = artworkCtrl.getImage();
-  zs.placement = { ...artworkCtrl.getPlacement() };
+  // энэ zone-ийн decal snapshot хадгалалт (3D дээр үлдээнэ)
+  zs.image = d.image;
+  zs.placement = { ...d.placement };
   zs.printZoneCM = { ...printZoneCM };
 
-  // decal-ийг activeZone дээр шинэчилж үлдээнэ
   scheduleDecalRebuild();
 
-  // zone lock
-  zoneLocks[activeZoneKey] = true;
-  syncLockUI();
+  // ✅ зөвхөн active zone-ийг LOCK болгоно
+  setLockedStateForZone(activeZoneKey, true);
 
-  // ✅ дараагийн зураг оруулахад бэлэн: current editor-оо цэвэрлэх
-  artworkCtrl.clear();
-  decalPose = null;
-
-  // input-г reset (same file дахин сонгож болдог)
+  // ✅ submit хийсний дараа "дараагийн зураг upload" боломжтой
   if (fileInput) fileInput.value = '';
 
-  redraw2D();
   hud.textContent += `\n✅ Saved & Locked: ${activeZoneKey}. You can upload next image now.`;
 });
 
 btnEdit?.addEventListener('click', () => {
-  // ✅ Edit = энэ zone-ийг unlock хийгээд (хэрэв өмнө хадгалсан бол) буцааж засварлах боломж
-  zoneLocks[activeZoneKey] = false;
-
   const zs = ensureZoneDecal(activeZoneKey);
-  if (zs.image && zs.placement) {
-    artworkCtrl.setImage(zs.image);
-    artworkCtrl.setPlacement({ ...zs.placement });
-
-    // тухайн zone-ийн texture map-г дахин тохируулна
-    setArtworkTextureFromImage(zs.image, zs.material, renderer, { flipU: true });
-
-    decalPose = zs.pose || null;
-    updatePoseFromPlacementUV();
-    scheduleDecalRebuild();
+  if (!zs?.mesh && !(zoneDrafts[activeZoneKey]?.image && zoneDrafts[activeZoneKey]?.placement)) {
+    // юу ч алга байвал edit хийх шаардлагагүй
+    return;
   }
 
-  syncLockUI();
+  setLockedStateForZone(activeZoneKey, false);
+
+  // хэрвээ өмнө saved байсан бол editor дээр буцааж гаргана
+  const d = zoneDrafts[activeZoneKey];
+  if (d?.image) setArtworkTextureFromImage(d.image, decalMat, renderer, { flipU: true });
+
   redraw2D();
   hud.textContent += `\n✏️ Edit: ${activeZoneKey}`;
 });
+
+
+
 
 // --------------------
 // Zone selector
 // --------------------
 function setActiveZone(key) {
+  // ✅ 1) save current zone draft BEFORE switching
+  saveDraftFor(activeZoneKey);
+
   if (!zones?.[key]) {
     console.warn('[setActiveZone] missing zone rect:', key);
     return;
   }
+
   activeZoneKey = key;
 
+  // print cm size update
   printZoneCM = (ZONE_CM?.[productKey]?.[activeZoneKey]) || printZoneCM;
 
+  // mesh by name
   const meshName = ZONE_MESH_NAMES[key];
   let found = null;
   tshirtRoot?.traverse(o => { if (o.name === meshName) found = o; });
   zoneMesh = found;
 
+  // dynamic zone width
   if (zoneMesh) {
     const b = new THREE.Box3().setFromObject(zoneMesh);
     const s = b.getSize(new THREE.Vector3());
@@ -468,39 +532,33 @@ function setActiveZone(key) {
 
   printZone = zones[key];
 
+  // label
   if (zoneLabel && printZoneCM) {
     zoneLabel.textContent = `Print Zone: ${printZoneCM.width} × ${printZoneCM.height} cm (${key})`;
   }
 
-  // ✅ zone солиход: тухайн zone lock UI-тай синк
+  // ✅ 2) restore new zone draft (ALWAYS, if-ээс гадна!)
+  restoreDraftFor(activeZoneKey);
+
+  // ✅ lock UI sync
   syncLockUI();
 
-  // ✅ энэ zone дээр өмнө хадгалсан зүйл байвал:
-  const zs = ensureZoneDecal(activeZoneKey);
+  // redraw 2D
+  redraw2D();
 
-  if (!isLocked()) {
-    // EDIT үед: saved байвал editor дээр авчирч харуулж болно
-    if (zs.image && zs.placement) {
-      artworkCtrl.setImage(zs.image);
-      artworkCtrl.setPlacement({ ...zs.placement });
-      setArtworkTextureFromImage(zs.image, zs.material, renderer, { flipU: true });
-      decalPose = zs.pose || null;
-      updatePoseFromPlacementUV();
-      scheduleDecalRebuild();
-    } else {
-      // шинэ zone (хоосон)
-      artworkCtrl.clear();
-      decalPose = null;
-    }
-  } else {
-    // LOCKED үед editor хоосон байж болно (3D дээр л харагдана)
-    artworkCtrl.clear();
+  // if this zone has placement+image, rebuild pose/decal
+  if (zoneDrafts[activeZoneKey]?.image && zoneDrafts[activeZoneKey]?.placement) {
     decalPose = null;
+    const poseOK = updatePoseFromPlacementUV();
+    if (poseOK) scheduleDecalRebuild();
   }
 
-  redraw2D();
+  // tab highlight
+  setActiveTabUI?.(activeZoneKey);
+
   console.log('[activeZone]', key, 'zoneMesh=', zoneMesh?.name, 'locked=', isLocked());
 }
+
 
 btnZoneFront?.addEventListener('click', () => setActiveZone('front'));
 btnZoneBack?.addEventListener('click', () => setActiveZone('back'));
@@ -829,6 +887,7 @@ function centerAndFitOnUpload(img, margin = 0.92) {
   scheduleDecalRebuild();
   redraw2D();
 }
+ 
 
 // --------------------
 // Upload image
@@ -837,36 +896,45 @@ fileInput?.addEventListener('change', async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
 
-  // ✅ хэрвээ энэ zone locked байхад upload хийвэл:
-  // тухайн zone-г автоматаар EDIT болгож, өмнөх decal-ийг солих боломж өгнө.
+  // хэрвээ энэ zone locked байвал upload хийхэд автоматаар EDIT болгоно
   if (isLocked()) {
-    zoneLocks[activeZoneKey] = false;
-    // өмнөх mesh-ийг хэрэглэгч солих гэж байна гэж үзээд устгана:
-    // (хэрвээ чи "солихгүй, шинэ layer нэм" гэвэл хэлээрэй — тусад нь layer system хийнэ)
+    setLockedStateForZone(activeZoneKey, false);
     clearZoneDecal(activeZoneKey);
-    syncLockUI();
   }
 
   const img = await loadImageFromFile(file);
   artworkCtrl.setImage(img);
 
-  // ⚠️ note: material map zone тус бүртэй байгаа (active zone дээр)
+  // active zone-ийн material дээр texture тавина
   const zs = ensureZoneDecal(activeZoneKey);
   setArtworkTextureFromImage(img, zs.material, renderer, { flipU: true });
 
+  // ✅ энд placement үүснэ (center & fit хийнэ)
   centerAndFitOnUpload(img, 0.92);
 
+  // ✅ placement бүрэн болсон хойно draft-д хадгал
+  zoneDrafts[activeZoneKey].image = img;
+  zoneDrafts[activeZoneKey].placement = artworkCtrl.getPlacement()
+    ? { ...artworkCtrl.getPlacement() }
+    : null;
+  zoneDrafts[activeZoneKey].locked = false;
+
+  // ✅ энэ upload-оор тухайн zone заавал EDIT байна
+  setLockedStateForZone(activeZoneKey, false);
+
+  // same file дахин сонгох боломж
+  if (fileInput) fileInput.value = '';
+
+  // width cm UI
   const p = artworkCtrl.getPlacement();
   if (p && inpWidthCm && printZoneCM?.width) {
     inpWidthCm.value = (printZoneCM.width * p.uScale).toFixed(1);
   }
 
-  hud.textContent = decalPose
-    ? 'Image ready. Click/drag on active 3D zone to place.'
-    : 'Image ready. Click on the active 3D zone to place.';
-
+  hud.textContent = 'Image ready. Click/drag on active 3D zone to place.';
   redraw2D();
 });
+
 
 // --------------------
 // Export (ALL zones + 3D preview screenshot)
