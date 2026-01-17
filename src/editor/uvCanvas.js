@@ -20,24 +20,34 @@ export function setupUVEditor(opts) {
   // --- template draw transform (contain) ---
   let tplX = 0, tplY = 0, tplW = 0, tplH = 0;
 
-  function resizeCanvasDPR() {
-    if (!artCanvas || !artViewport) return;
+function resizeCanvasDPR() {
+  if (!artCanvas || !artViewport) return;
 
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const cssW = Math.max(300, artViewport.clientWidth - 32);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
 
-    // ✅ aspect = template aspect (байвал)
-    const tpl = template?.img;
-    const aspect = tpl ? (tpl.height / Math.max(1e-6, tpl.width)) : 1;
+  const pad = 32; // чи өмнө нь -32 хэрэглэж байсан
+  const availW = Math.max(300, artViewport.clientWidth - pad);
+  const availH = Math.max(300, artViewport.clientHeight - pad);
 
-    const cssH = Math.round(cssW * aspect);
+  const tpl = template?.img;
+  const aspect = tpl ? (tpl.height / Math.max(1e-6, tpl.width)) : 1;
 
-    artCanvas.style.width = `${cssW}px`;
-    artCanvas.style.height = `${cssH}px`;
+  // ✅ width + height хоёрын аль алинд нь багтаана
+  let cssW = availW;
+  let cssH = Math.round(cssW * aspect);
 
-    artCanvas.width = Math.round(cssW * dpr);
-    artCanvas.height = Math.round(cssH * dpr);
+  if (cssH > availH) {
+    cssH = availH;
+    cssW = Math.round(cssH / aspect);
   }
+
+  artCanvas.style.width = `${cssW}px`;
+  artCanvas.style.height = `${cssH}px`;
+
+  artCanvas.width = Math.round(cssW * dpr);
+  artCanvas.height = Math.round(cssH * dpr);
+}
+
 
   function drawTemplateContain() {
     const tpl = template?.img;

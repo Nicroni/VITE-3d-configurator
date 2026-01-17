@@ -1,5 +1,4 @@
 // src/main.js
-
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import './styless.css';
@@ -25,13 +24,13 @@ import {
 import { buildPoseFromHit } from './decal/decalPose.js';
 import { buildDecalMesh, disposeDecalMesh } from './decal/decalBuilder.js';
 
-import { bakeTemplatePNGAndJSON } from './print/exportPNG.js';
+import { bakeTemplatePNGAndJSON, bakeManyPNGsAndJSON } from './print/exportPNG.js';
 import { loadImageFromFile } from './utils/image.js';
 import { downloadDataURL, downloadText } from './utils/download.js';
 
 import { ZONE_CM } from './config/printZones.js';
 import { DEFAULT_DPI, DEFAULT_TEMPLATE_PX, DECAL_DEPTH, WORLD_ZONE_W } from './config/constants.js';
-import { getSafeRectRel, isPlacementInsideSafe, clampPlacementToSafe } from './editor/safeZone.js';
+import { getSafeRectRel, clampPlacementToSafe } from './editor/safeZone.js';
 
 // --------------------
 // DOM
@@ -79,12 +78,9 @@ initScene({
 const { scene, camera } = getContext();
 const { renderer, canvas } = createRenderer(viewer3d, { alpha: false });
 
-if ('outputColorSpace' in renderer) {
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-} else {
-  // eslint-disable-next-line
-  renderer.outputEncoding = THREE.sRGBEncoding;
-}
+if ('outputColorSpace' in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+else renderer.outputEncoding = THREE.sRGBEncoding;
+
 renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
 
 const controls = createControls(camera, canvas);
@@ -145,28 +141,29 @@ let tshirtRoot = null;
 
 let zones = {};              // { front:{uMin..}, back:{..} ... }
 let activeZoneKey = 'front';
-let zoneMesh = null;         // active zone mesh
-let printZone = null;        // active zone rect in UV
+let zoneMesh = null;
+let printZone = null;
 
 let printZoneCM = (ZONE_CM?.[productKey]?.[activeZoneKey]) || { width: 30, height: 40 };
-
-// decal sizing base (world units)
 let WORLD_ZONE_W_DYNAMIC = WORLD_ZONE_W;
 
-// decal state
-let decalMesh = null;
-let decalPose = null;
-
-let isLocked = false;
 let isDragging = false;
 
+// ✅ per-zone lock (submit хийсэн талыг дахин хөдөлгөхгүй болгоно)
+const zoneLocks = { front: false, back: false, left_arm: false, right_arm: false };
+function isLocked() { return !!zoneLocks[activeZoneKey]; }
+
+// decal per zone
+const zoneDecals = {
+  // key: { mesh, pose, material, image, placement, printZoneCM }
+};
+
+let decalPose = null;
 let decalW = 0.25;
 let decalH = 0.25;
 
-// editor instance
 let editor = null;
 
-// throttle for decal rebuild
 let decalBuildRaf = 0;
 function scheduleDecalRebuild() {
   if (decalBuildRaf) return;
@@ -189,9 +186,7 @@ function redraw2D() {
 
 const artworkCtrl = createArtworkController({
   onUpdate: () => {
-    // editor байхгүй үед redraw хийхгүй
     redraw2D();
-
     const poseOK = updatePoseFromPlacementUV();
     if (artworkCtrl.hasImage() && (decalPose || poseOK)) scheduleDecalRebuild();
   }
@@ -200,6 +195,32 @@ const artworkCtrl = createArtworkController({
 // --------------------
 // Helpers
 // --------------------
+function ensureZoneDecal(key) {
+  if (!zoneDecals[key]) {
+    zoneDecals[key] = {
+      mesh: null,
+      pose: null,
+      material: createDecalMaterial(renderer).material,
+      image: null,
+      placement: null,
+      printZoneCM: null,
+    };
+  }
+  return zoneDecals[key];
+}
+
+function clearZoneDecal(key) {
+  const zs = ensureZoneDecal(key);
+  if (zs.mesh) {
+    disposeDecalMesh(zs.mesh, scene);
+    zs.mesh = null;
+  }
+  zs.pose = null;
+  zs.image = null;
+  zs.placement = null;
+  zs.printZoneCM = null;
+}
+
 function clampPlacementNow() {
   const p = artworkCtrl.getPlacement?.();
   if (!p) return false;
@@ -207,7 +228,6 @@ function clampPlacementNow() {
   const key = activeZoneKey || 'front';
   const safe = getSafeRectRel(key, printZoneCM);
 
-  // хэмжээс их байвал safe-ээс том байх тохиолдолд “зөөлөн” багасгаж багтаая
   const maxUS = Math.max(1e-6, safe.uMax - safe.uMin);
   const maxVS = Math.max(1e-6, safe.vMax - safe.vMin);
   p.uScale = Math.min(p.uScale, maxUS);
@@ -217,7 +237,6 @@ function clampPlacementNow() {
   artworkCtrl.setPlacement(p);
   return true;
 }
-
 
 function readSnapUI() {
   return {
@@ -240,7 +259,7 @@ function syncDecalWHFromPlacement() {
   decalH = Math.min(1.5, Math.max(0.05, h));
 }
 
-// placement (top->down) -> absolute UV (bottom->up)
+// placement (zone-local) -> abs UV (v flip)
 function relToAbsUV(pu, pv, rect) {
   const u = rect.uMin + pu * (rect.uMax - rect.uMin);
   const v = rect.vMax - pv * (rect.vMax - rect.vMin);
@@ -281,14 +300,13 @@ function findHitWithFallback(targetMesh, prefUV) {
 
 function updatePoseFromPlacementUV() {
   if (!printZone) return false;
-  if (!zoneMesh || !zoneMesh.isMesh) return false;   // ✅ ALWAYS use active zone mesh
+  if (!zoneMesh || !zoneMesh.isMesh) return false;
 
   const p = artworkCtrl.getPlacement?.();
   if (!p) return false;
 
   const prefUV = relToAbsUV(p.u, p.v, printZone);
 
-  // ✅ UV pick ONLY on zoneMesh
   let hit = pickOnMeshByUV(zoneMesh, prefUV, { uvAttr: 'uv' });
   if (!hit) hit = pickOnMeshByUV(zoneMesh, prefUV, { uvAttr: 'uv2' });
   if (!hit) hit = findHitWithFallback(zoneMesh, prefUV);
@@ -297,30 +315,34 @@ function updatePoseFromPlacementUV() {
   const pose = buildPoseFromHit(hit);
   if (!pose) return false;
 
-  // ✅ CRITICAL: lock pose object to current zoneMesh
+  // ✅ save pose into active zone slot
   pose.object = zoneMesh;
-
   decalPose = pose;
+
+  const zs = ensureZoneDecal(activeZoneKey);
+  zs.pose = pose;
+
   return true;
 }
 
-
 function applyDecalFromPose() {
-  if (!decalPose || !artworkCtrl.hasImage() || !hasArtworkTexture()) return;
+  const zs = ensureZoneDecal(activeZoneKey);
+  if (!zs.pose || !artworkCtrl.hasImage() || !hasArtworkTexture()) return;
+  if (!zs.material?.map) return;
 
   syncDecalWHFromPlacement();
   const rotationRad = (artworkCtrl.getPlacement()?.rotationRad) || 0;
 
   const mesh = buildDecalMesh(
-    decalPose,
+    zs.pose,
     { width: decalW, height: decalH, depth: DECAL_DEPTH },
     rotationRad,
-    decalMat
+    zs.material
   );
 
-  disposeDecalMesh(decalMesh, scene);
-  decalMesh = mesh;
-  scene.add(decalMesh);
+  if (zs.mesh) disposeDecalMesh(zs.mesh, scene);
+  zs.mesh = mesh;
+  scene.add(zs.mesh);
 }
 
 // --------------------
@@ -345,39 +367,80 @@ Artwork:
   center: u=${a.u?.toFixed(4)}, v=${a.v?.toFixed(4)}
   size:   uS=${a.uScale?.toFixed(4)}, vS=${a.vScale?.toFixed(4)}
   rot:    ${((a.rotationRad || 0) * 57.2958).toFixed(1)}°
-Mode: ${isLocked ? 'LOCKED' : 'EDIT'} (Shift=snap off | Shift=ratio-lock on resize | Alt=uniform)`;
+Zone: ${activeZoneKey} | ${isLocked() ? 'LOCKED' : 'EDIT'}`;
 }
 
 // --------------------
-// Lock / Edit
+// Lock / Edit (per-zone)
 // --------------------
-function setLockedState(lock) {
-  isLocked = lock;
-  setControlMode(isLocked ? 'LOCKED' : 'EDIT');
+function syncLockUI() {
+  const locked = isLocked();
+  setControlMode(locked ? 'LOCKED' : 'EDIT');
 
-  if (isLocked) {
-    isDragging = false;
-    btnSubmit && (btnSubmit.disabled = true);
-    btnEdit && (btnEdit.disabled = false);
-    hud.textContent += '\n🔒 Locked. Click Edit to modify again.';
-  } else {
-    btnSubmit && (btnSubmit.disabled = false);
-    btnEdit && (btnEdit.disabled = true);
-    hud.textContent += '\n✏️ Edit mode.';
-  }
+  if (btnSubmit) btnSubmit.disabled = locked;
+  if (btnEdit) btnEdit.disabled = !locked;
 }
 
 btnSubmit?.addEventListener('click', () => {
-  if (!artworkCtrl.hasPlacement() || !decalMesh) {
-    alert('Place artwork first.');
+  // ✅ Submit = тухайн zone-ийн зураг/placement/pose-г хадгалаад,
+  // дараагийн зураг оруулахад бэлэн болгож artworkCtrl-оо цэвэрлэнэ.
+  if (!artworkCtrl.hasImage() || !artworkCtrl.hasPlacement()) {
+    alert('Upload + Place artwork first.');
     return;
   }
-  setLockedState(true);
+
+  const zs = ensureZoneDecal(activeZoneKey);
+
+  // pose баталгаажуулах
+  const poseOK = updatePoseFromPlacementUV();
+  if (!poseOK || !zs.pose) {
+    alert('Pose not ready. Click on the 3D zone once to place.');
+    return;
+  }
+
+  // тухайн zone-ийн snapshot хадгална
+  zs.image = artworkCtrl.getImage();
+  zs.placement = { ...artworkCtrl.getPlacement() };
+  zs.printZoneCM = { ...printZoneCM };
+
+  // decal-ийг activeZone дээр шинэчилж үлдээнэ
+  scheduleDecalRebuild();
+
+  // zone lock
+  zoneLocks[activeZoneKey] = true;
+  syncLockUI();
+
+  // ✅ дараагийн зураг оруулахад бэлэн: current editor-оо цэвэрлэх
+  artworkCtrl.clear();
+  decalPose = null;
+
+  // input-г reset (same file дахин сонгож болдог)
+  if (fileInput) fileInput.value = '';
+
+  redraw2D();
+  hud.textContent += `\n✅ Saved & Locked: ${activeZoneKey}. You can upload next image now.`;
 });
 
 btnEdit?.addEventListener('click', () => {
-  if (!decalMesh) return;
-  setLockedState(false);
+  // ✅ Edit = энэ zone-ийг unlock хийгээд (хэрэв өмнө хадгалсан бол) буцааж засварлах боломж
+  zoneLocks[activeZoneKey] = false;
+
+  const zs = ensureZoneDecal(activeZoneKey);
+  if (zs.image && zs.placement) {
+    artworkCtrl.setImage(zs.image);
+    artworkCtrl.setPlacement({ ...zs.placement });
+
+    // тухайн zone-ийн texture map-г дахин тохируулна
+    setArtworkTextureFromImage(zs.image, zs.material, renderer, { flipU: true });
+
+    decalPose = zs.pose || null;
+    updatePoseFromPlacementUV();
+    scheduleDecalRebuild();
+  }
+
+  syncLockUI();
+  redraw2D();
+  hud.textContent += `\n✏️ Edit: ${activeZoneKey}`;
 });
 
 // --------------------
@@ -390,16 +453,13 @@ function setActiveZone(key) {
   }
   activeZoneKey = key;
 
-  // print cm size update (маш чухал)
   printZoneCM = (ZONE_CM?.[productKey]?.[activeZoneKey]) || printZoneCM;
 
-  // mesh by name
   const meshName = ZONE_MESH_NAMES[key];
   let found = null;
   tshirtRoot?.traverse(o => { if (o.name === meshName) found = o; });
   zoneMesh = found;
 
-  // dynamic zone width
   if (zoneMesh) {
     const b = new THREE.Box3().setFromObject(zoneMesh);
     const s = b.getSize(new THREE.Vector3());
@@ -412,11 +472,34 @@ function setActiveZone(key) {
     zoneLabel.textContent = `Print Zone: ${printZoneCM.width} × ${printZoneCM.height} cm (${key})`;
   }
 
-  // editor refresh
-  if (editor?.setPrintZoneCM) editor.setPrintZoneCM(printZoneCM);
-  redraw2D();
+  // ✅ zone солиход: тухайн zone lock UI-тай синк
+  syncLockUI();
 
-  console.log('[activeZone]', key, 'zoneMesh=', zoneMesh?.name);
+  // ✅ энэ zone дээр өмнө хадгалсан зүйл байвал:
+  const zs = ensureZoneDecal(activeZoneKey);
+
+  if (!isLocked()) {
+    // EDIT үед: saved байвал editor дээр авчирч харуулж болно
+    if (zs.image && zs.placement) {
+      artworkCtrl.setImage(zs.image);
+      artworkCtrl.setPlacement({ ...zs.placement });
+      setArtworkTextureFromImage(zs.image, zs.material, renderer, { flipU: true });
+      decalPose = zs.pose || null;
+      updatePoseFromPlacementUV();
+      scheduleDecalRebuild();
+    } else {
+      // шинэ zone (хоосон)
+      artworkCtrl.clear();
+      decalPose = null;
+    }
+  } else {
+    // LOCKED үед editor хоосон байж болно (3D дээр л харагдана)
+    artworkCtrl.clear();
+    decalPose = null;
+  }
+
+  redraw2D();
+  console.log('[activeZone]', key, 'zoneMesh=', zoneMesh?.name, 'locked=', isLocked());
 }
 
 btnZoneFront?.addEventListener('click', () => setActiveZone('front'));
@@ -431,8 +514,8 @@ let resizingCorner = null;
 let resizeStart = null;
 
 function beginResize(corner, e) {
-  if (isLocked) return;
-  if (!artworkCtrl.hasPlacement() || !decalPose) return;
+  if (isLocked()) return;
+  if (!artworkCtrl.hasPlacement()) return;
 
   e.preventDefault();
   e.stopPropagation();
@@ -454,13 +537,14 @@ function beginResize(corner, e) {
   Object.entries(map).forEach(([key, el]) => {
     if (!el) return;
     el.addEventListener('pointerdown', (e) => {
-      const corner = key.replace('h', '').toLowerCase(); // tl/tr/bl/br
+      const corner = key.replace('h', '').toLowerCase();
       beginResize(corner, e);
     });
   });
 
   window.addEventListener('pointermove', (e) => {
     if (!resizingCorner || !resizeStart) return;
+    if (isLocked()) return;
 
     let dx = e.clientX - resizeStart.x;
     let dy = e.clientY - resizeStart.y;
@@ -517,7 +601,7 @@ function loadTemplateImage(url) {
 // 2D wheel scale
 // --------------------
 artViewport?.addEventListener('wheel', (e) => {
-  if (isLocked) return;
+  if (isLocked()) return;
   if (!artworkCtrl.hasPlacement()) return;
   e.preventDefault();
   e.stopPropagation();
@@ -531,7 +615,7 @@ artViewport?.addEventListener('wheel', (e) => {
 
 // Apply width in cm
 btnApplyCm?.addEventListener('click', () => {
-  if (isLocked) return;
+  if (isLocked()) return;
   if (!artworkCtrl.hasPlacement()) return;
   const widthCm = parseFloat(inpWidthCm?.value || '0');
   if (!widthCm || widthCm <= 0) return;
@@ -631,7 +715,7 @@ loader.load(
 // --------------------
 canvas.addEventListener('pointerdown', (e) => {
   if (!printZone) return;
-  if (isLocked) return;
+  if (isLocked()) return;
   if (resizingCorner) return;
 
   const hit = hitTest(e, camera, zoneMesh, canvas);
@@ -651,32 +735,39 @@ canvas.addEventListener('pointerdown', (e) => {
   controls.enabled = false;
 
   artworkCtrl.placeAtUV(hit.uv, printZone);
-  clampPlacementNow(); 
+  clampPlacementNow();
   renderHUD(hit.uv);
 
   const pose = buildPoseFromHit(hit);
   if (!pose) return;
+  pose.object = zoneMesh;
   decalPose = pose;
+
+  const zs = ensureZoneDecal(activeZoneKey);
+  zs.pose = pose;
 
   scheduleDecalRebuild();
   redraw2D();
-  btnSubmit && (btnSubmit.disabled = false);
 });
 
 canvas.addEventListener('pointermove', (e) => {
-  if (isLocked || !isDragging || resizingCorner) return;
+  if (isLocked() || !isDragging || resizingCorner) return;
 
   const hit = hitTest(e, camera, zoneMesh, canvas);
   if (!hit) return;
   if (!isUVInsidePrintZone(hit.uv, printZone)) return;
 
   artworkCtrl.placeAtUV(hit.uv, printZone);
-  clampPlacementNow(); 
+  clampPlacementNow();
   renderHUD(hit.uv);
 
   const pose = buildPoseFromHit(hit);
   if (!pose) return;
+  pose.object = zoneMesh;
   decalPose = pose;
+
+  const zs = ensureZoneDecal(activeZoneKey);
+  zs.pose = pose;
 
   scheduleDecalRebuild();
   redraw2D();
@@ -691,7 +782,7 @@ window.addEventListener('pointerup', () => {
 viewer3d.addEventListener('wheel', (e) => {
   const scaleIntent = e.altKey || e.shiftKey;
   if (!scaleIntent) return;
-  if (isLocked) return;
+  if (isLocked()) return;
   if (!artworkCtrl.hasPlacement()) return;
 
   e.preventDefault();
@@ -706,7 +797,7 @@ viewer3d.addEventListener('wheel', (e) => {
 // Rotate (R)
 window.addEventListener('keydown', (e) => {
   if (e.key.toLowerCase() === 'r') {
-    if (isLocked) return;
+    if (isLocked()) return;
     artworkCtrl.rotateByDeg(5);
     scheduleDecalRebuild();
     redraw2D();
@@ -733,8 +824,7 @@ function centerAndFitOnUpload(img, margin = 0.92) {
 
   artworkCtrl.setPlacement(p);
   clampPlacementNow();
-  clampPlacementNow();
-  // pose update (if possible)
+
   updatePoseFromPlacementUV();
   scheduleDecalRebuild();
   redraw2D();
@@ -747,11 +837,22 @@ fileInput?.addEventListener('change', async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
 
+  // ✅ хэрвээ энэ zone locked байхад upload хийвэл:
+  // тухайн zone-г автоматаар EDIT болгож, өмнөх decal-ийг солих боломж өгнө.
+  if (isLocked()) {
+    zoneLocks[activeZoneKey] = false;
+    // өмнөх mesh-ийг хэрэглэгч солих гэж байна гэж үзээд устгана:
+    // (хэрвээ чи "солихгүй, шинэ layer нэм" гэвэл хэлээрэй — тусад нь layer system хийнэ)
+    clearZoneDecal(activeZoneKey);
+    syncLockUI();
+  }
+
   const img = await loadImageFromFile(file);
   artworkCtrl.setImage(img);
 
-  // ✅ mirror fix: flipU true (if your mesh UV causes horizontal mirror)
-  setArtworkTextureFromImage(img, decalMat, renderer, { flipU: true });
+  // ⚠️ note: material map zone тус бүртэй байгаа (active zone дээр)
+  const zs = ensureZoneDecal(activeZoneKey);
+  setArtworkTextureFromImage(img, zs.material, renderer, { flipU: true });
 
   centerAndFitOnUpload(img, 0.92);
 
@@ -760,37 +861,85 @@ fileInput?.addEventListener('change', async (e) => {
     inpWidthCm.value = (printZoneCM.width * p.uScale).toFixed(1);
   }
 
-  setLockedState(false);
-  btnEdit && (btnEdit.disabled = true);
-
   hud.textContent = decalPose
-    ? 'Image centered on 2D and posed on 3D (UV pick).'
-    : 'Image centered on 2D. Click on the active 3D zone to place.';
+    ? 'Image ready. Click/drag on active 3D zone to place.'
+    : 'Image ready. Click on the active 3D zone to place.';
+
+  redraw2D();
 });
 
 // --------------------
-// Export
+// Export (ALL zones + 3D preview screenshot)
 // --------------------
 btnExport?.addEventListener('click', async () => {
-  if (!printZone) return alert('No print zone yet.');
-  if (!artworkCtrl.hasPlacement()) return alert('Place artwork first.');
+  if (!zones || Object.keys(zones).length === 0) {
+    alert('Zones not ready.');
+    return;
+  }
 
-  const placement = artworkCtrl.getPlacement();
-  const product = { id: productKey, side: activeZoneKey };
+  // ✅ collect jobs from all zones that have saved decal (OR currently editing)
+  const jobs = [];
+  const keys = ['front', 'back', 'left_arm', 'right_arm'];
 
-  const result = await bakeTemplatePNGAndJSON({
-    artworkImage: artworkCtrl.getImage(),
-    placement,
-    printZone,
-    printZoneCM,
+  for (const k of keys) {
+    const zs = ensureZoneDecal(k);
+
+    // priority: saved snapshot (submit хийсэн)
+    const img = zs.image;
+    const plc = zs.placement;
+    const zrect = zones[k];
+    const zcm = zs.printZoneCM || (ZONE_CM?.[productKey]?.[k]);
+
+    if (img && plc && zrect && zcm) {
+      jobs.push({
+        key: k,
+        artworkImage: img,
+        placement: plc,
+        printZone: zrect,
+        printZoneCM: zcm,
+        product: { id: productKey, side: k },
+      });
+    }
+  }
+
+  // хэрвээ submit хийгээгүй ч active zone дээр одоо зурагтай байвал export-д оруулна
+  if (artworkCtrl.hasImage() && artworkCtrl.hasPlacement() && zones?.[activeZoneKey]) {
+    const already = jobs.some(j => j.key === activeZoneKey);
+    if (!already) {
+      jobs.push({
+        key: activeZoneKey,
+        artworkImage: artworkCtrl.getImage(),
+        placement: { ...artworkCtrl.getPlacement() },
+        printZone: zones[activeZoneKey],
+        printZoneCM: printZoneCM,
+        product: { id: productKey, side: activeZoneKey },
+      });
+    }
+  }
+
+  if (jobs.length === 0) {
+    alert('No saved artworks to export. Use Submit(Lock) on a zone (or have active placement).');
+    return;
+  }
+
+  // 1) flat print PNG + JSON (each zone)
+  const results = await bakeManyPNGsAndJSON({
+    jobs,
     dpi: DEFAULT_DPI,
     templatePx: DEFAULT_TEMPLATE_PX,
-    product
   });
 
-  downloadDataURL(result.pngDataURL, 'print-template.png');
-  downloadText(JSON.stringify(result.json, null, 2), 'print-job.json');
-  alert('Exported: print-template.png + print-job.json');
+  for (const r of results) {
+    downloadDataURL(r.pngDataURL, `print-${productKey}-${r.key}.png`);
+    downloadText(JSON.stringify(r.json, null, 2), `print-${productKey}-${r.key}.json`);
+  }
+
+  // 2) 3D preview screenshot (all decals visible)
+  renderer.render(scene, camera);
+  const previewURL = renderer.domElement.toDataURL('image/png');
+  downloadDataURL(previewURL, `preview-3d-${productKey}.png`);
+
+  alert(`Exported ${results.length} zone(s) + 3D preview screenshot.`);
 });
 
 // --------------------

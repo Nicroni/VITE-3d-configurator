@@ -1,4 +1,3 @@
-
 // src/print/exportPNG.js
 /**
  * Bake a flat PNG template + JSON job for printing.
@@ -7,13 +6,13 @@
 export async function bakeTemplatePNGAndJSON({
   artworkImage,
   placement,       // {u,v,uScale,vScale,rotationRad}
-  printZone,       // {uMin,uMax,vMin,vMax}
+  printZone,       // {uMin,uMax,vMin,vMax, name?}
   printZoneCM,     // {width,height}
   dpi = 300,
   templatePx = 4096,
   product = { id: 'tshirt', side: 'front' }
 }) {
-  const aspect = printZoneCM.height / printZoneCM.width; // e.g. 40/30 => 4/3
+  const aspect = printZoneCM.height / printZoneCM.width;
   const outW = templatePx;
   const outH = Math.round(outW * aspect);
 
@@ -21,12 +20,9 @@ export async function bakeTemplatePNGAndJSON({
   canvas.width = outW; canvas.height = outH;
   const ctx = canvas.getContext('2d');
 
-  // white background
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, outW, outH);
 
-  // draw artwork per placement
-  // placement u/v are center in [0..1] of zone; scale are fraction of zone
   const cx = placement.u * outW;
   const cy = (1 - placement.v) * outH;
   const dw = placement.uScale * outW;
@@ -35,14 +31,13 @@ export async function bakeTemplatePNGAndJSON({
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(placement.rotationRad || 0);
-  ctx.drawImage(artworkImage, -dw/2, -dh/2, dw, dh);
+  ctx.drawImage(artworkImage, -dw / 2, -dh / 2, dw, dh);
   ctx.restore();
 
-  // Build JSON
   const json = {
     product,
     zone: {
-      name: printZone.name,
+      name: printZone.name || product.side,
       cm: printZoneCM,
       uv: { uMin: printZone.uMin, uMax: printZone.uMax, vMin: printZone.vMin, vMax: printZone.vMax }
     },
@@ -62,3 +57,28 @@ export async function bakeTemplatePNGAndJSON({
   return { pngDataURL, json };
 }
 
+/**
+ * ✅ NEW: batch helper
+ * jobs: [{ key:'front', artworkImage, placement, printZone, printZoneCM, product }]
+ */
+export async function bakeManyPNGsAndJSON({
+  jobs,
+  dpi = 300,
+  templatePx = 4096,
+}) {
+  const results = [];
+  for (const j of jobs) {
+    if (!j?.artworkImage || !j?.placement || !j?.printZone || !j?.printZoneCM) continue;
+    const r = await bakeTemplatePNGAndJSON({
+      artworkImage: j.artworkImage,
+      placement: j.placement,
+      printZone: j.printZone,
+      printZoneCM: j.printZoneCM,
+      dpi,
+      templatePx,
+      product: j.product || { id: 'tshirt', side: j.key || 'front' },
+    });
+    results.push({ key: j.key, ...r });
+  }
+  return results;
+}

@@ -1,11 +1,8 @@
-
 // src/editor/placement.js
 import { clamp } from './clamp.js';
 
 export function createArtworkController({ onUpdate } = {}) {
   let image = null;
-  // placement in UV space of print-zone rect:
-  // u,v = center [0..1], uScale,vScale = size as fraction of zone
   let placement = null; // { u, v, uScale, vScale, rotationRad }
 
   const api = {
@@ -17,9 +14,10 @@ export function createArtworkController({ onUpdate } = {}) {
     getPlacement() { return placement; },
     hasPlacement() { return !!placement; },
 
+    clear() { image = null; placement = null; onUpdate?.(); }, // ✅ NEW
+
     /** place center at uv inside given printZone {uMin,uMax,vMin,vMax} */
     placeAtUV(hitUV, printZone) {
-      // normalize hitUV within zone rect to 0..1
       const u = (hitUV.x - printZone.uMin) / Math.max(1e-6, (printZone.uMax - printZone.uMin));
       const v = (hitUV.y - printZone.vMin) / Math.max(1e-6, (printZone.vMax - printZone.vMin));
       if (!placement) {
@@ -61,7 +59,6 @@ export function cmToPlacementWidth(widthCm, printZoneCM) {
   return clamp(widthCm / printZoneCM.width, 0.05, 1.2);
 }
 
-/** snapping helpers */
 export function applySnap(p, {
   enableCenterSnap,
   enableGridSnap,
@@ -70,7 +67,6 @@ export function applySnap(p, {
   shiftToDisable = false,
   shiftKey = false,
 }) {
-  // if Shift disables snap
   if (shiftToDisable && shiftKey) return p;
 
   const r = { ...p };
@@ -91,4 +87,3 @@ export function applySnap(p, {
 
   return r;
 }
-
