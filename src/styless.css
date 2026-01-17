@@ -89,6 +89,15 @@ body{margin:0;font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Ro
   border: 1px dashed #e5e7eb;
   overflow:hidden;
 }
+/* overlay box нь canvas-ийн pointer event-ийг булаахгүй */
+#overlayBox { pointer-events: none; }
+
+/* зөвхөн resize handle-ууд л pointer event авна */
+#overlayBox .handle,
+#overlayBox .tl, #overlayBox .tr, #overlayBox .bl, #overlayBox .br {
+  pointer-events: auto;
+}
+
 #artCanvas{ width:100%; height:100%; display:block; }
 /* styless.css */
 #viewer3d {

@@ -1,392 +1,363 @@
-
 // src/editor/uvCanvas.js
 import * as THREE from 'three';
 import { cmToPlacementWidth, applySnap } from './placement.js';
 import { clamp } from './clamp.js';
 import { worldToScreen } from './transforms.js';
+import { getSafeRectRel, isPlacementInsideSafe, clampPlacementToSafe } from './safeZone.js';
 
-/**
- * 2D Canvas Editor + 3D Overlay (Photoshop-like)
- * @param {{
- *   artCanvas: HTMLCanvasElement,
- *   artViewport: HTMLElement,
- *   overlayBox: HTMLElement,
- *   handles: { hTL:HTMLElement, hTR:HTMLElement, hBL:HTMLElement, hBR:HTMLElement },
- *   hud: HTMLElement,
- *   camera: THREE.Camera,
- *   canvas3D: HTMLCanvasElement,
- *   printZoneCM: {width:number,height:number},
- *   getPose: () => { position:THREE.Vector3, baseOrientation:THREE.Euler } | null,
- *   getDecalSize: () => { w:number, h:number },
- *   setDecalSize: (w:number, h:number) => void,
- *   artworkCtrl: { getPlacement:Function, setPlacement:Function, hasPlacement:Function, getImage:Function, hasImage:Function, rotateByDeg:Function },
- *   readSnapUI: () => { enableCenter:boolean, enableGrid:boolean, gridCm:number },
- *   onApplyDecalFromPose: () => void,
- * }} opts
- */
 export function setupUVEditor(opts) {
   const {
     artCanvas, artViewport, overlayBox, handles, hud,
     camera, canvas3D, printZoneCM, getPose, getDecalSize, setDecalSize,
-    artworkCtrl, readSnapUI, onApplyDecalFromPose
+    artworkCtrl, readSnapUI, onApplyDecalFromPose,
+    template,            // ✅ { img: HTMLImageElement }
+    zones,               // ✅ { front:{uMin..}, back:{..}, left_arm:{..}, right_arm:{..} }
+    getActiveZoneKey,    // ✅ () => 'front' | 'back' | 'left_arm' | 'right_arm'
   } = opts;
 
   const ctx = artCanvas?.getContext('2d');
 
-  // Canvas харьцаа = PRINT_ZONE_FRONT (H/W)
-  const zoneAspect = (printZoneCM?.height || 40) / Math.max(1e-6, (printZoneCM?.width || 30));
+  // --- template draw transform (contain) ---
+  let tplX = 0, tplY = 0, tplW = 0, tplH = 0;
 
-  // 2D editor state
-  let edScale = 1;
-  let edPan = { x: 0, y: 0 };
-  let edDragging = false;
-  let edPanning = false;
-  let spaceHeld = false;
-
-  // DPI‑aware canvas resize (viewport өргөнд тааруулан, aspect=zoneAspect)
   function resizeCanvasDPR() {
     if (!artCanvas || !artViewport) return;
 
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const cssW = Math.max(300, artViewport.clientWidth - 32);
-    const cssH = Math.round(cssW * zoneAspect);
 
-    artCanvas.style.width  = `${cssW}px`;
+    // ✅ aspect = template aspect (байвал)
+    const tpl = template?.img;
+    const aspect = tpl ? (tpl.height / Math.max(1e-6, tpl.width)) : 1;
+
+    const cssH = Math.round(cssW * aspect);
+
+    artCanvas.style.width = `${cssW}px`;
     artCanvas.style.height = `${cssH}px`;
 
-    artCanvas.width  = Math.round(cssW * dpr);
+    artCanvas.width = Math.round(cssW * dpr);
     artCanvas.height = Math.round(cssH * dpr);
   }
 
-  // Background + guides + zone label
+  function drawTemplateContain() {
+    const tpl = template?.img;
+    if (!tpl || !ctx) return;
+
+    const cw = artCanvas.width, ch = artCanvas.height;
+    const s = Math.min(cw / tpl.width, ch / tpl.height);
+
+    tplW = tpl.width * s;
+    tplH = tpl.height * s;
+    tplX = (cw - tplW) * 0.5;
+    tplY = (ch - tplH) * 0.5;
+
+    ctx.drawImage(tpl, tplX, tplY, tplW, tplH);
+  }
+
+  // ✅ UV(0..1) -> canvas px (template-ийн contain transform ашиглана)
+  function uvToCanvasPx(u, v) {
+    const x = tplX + u * tplW;
+    const y = tplY + (1 - v) * tplH; // v up -> canvas down
+    return { x, y };
+  }
+
+  // ✅ A) canvas px -> abs UV (template contain transform ашиглана)
+  function canvasPxToAbsUV(x, y) {
+    const u0 = (x - tplX) / Math.max(1e-6, tplW);
+    const v0 = 1 - ((y - tplY) / Math.max(1e-6, tplH)); // v up
+    return {
+      u: clamp(u0, 0, 1),
+      v: clamp(v0, 0, 1),
+    };
+  }
+
   function drawBackdrop() {
     if (!ctx) return;
-    ctx.save();
 
+    ctx.save();
+    ctx.clearRect(0, 0, artCanvas.width, artCanvas.height);
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, artCanvas.width, artCanvas.height);
 
-    ctx.strokeStyle = 'rgba(0,0,0,0.12)';
-    ctx.lineWidth = 1 * (window.devicePixelRatio || 1);
-    ctx.strokeRect(0, 0, artCanvas.width, artCanvas.height);
+    drawTemplateContain();
 
-    // Center guides
-    ctx.globalAlpha = .35;
-    ctx.beginPath();
-    ctx.moveTo(artCanvas.width / 2, 0);
-    ctx.lineTo(artCanvas.width / 2, artCanvas.height);
-    ctx.moveTo(0, artCanvas.height / 2);
-    ctx.lineTo(artCanvas.width, artCanvas.height / 2);
-    ctx.stroke();
+    // zones rectangles
+    if (zones && tplW > 0 && tplH > 0) {
+      Object.entries(zones).forEach(([key, z]) => {
+        if (!z) return;
 
-    // Label
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ui-monospace,monospace`;
-    const label = `PRINT ZONE: ${printZoneCM?.width || '?'}×${printZoneCM?.height || '?'} cm`;
-    ctx.fillText(label, 8 * (window.devicePixelRatio || 1), 18 * (window.devicePixelRatio || 1));
+        const active = (getActiveZoneKey?.() === key);
+
+        const p0 = uvToCanvasPx(z.uMin, z.vMax);
+        const p1 = uvToCanvasPx(z.uMax, z.vMin);
+        const x = p0.x;
+        const y = p0.y;
+        const w = p1.x - p0.x;
+        const h = p1.y - p0.y;
+
+        ctx.save();
+        ctx.globalAlpha = active ? 0.22 : 0.10;
+        ctx.fillStyle = active ? 'rgba(0,140,255,1)' : 'rgba(0,0,0,1)';
+        ctx.fillRect(x, y, w, h);
+
+        ctx.globalAlpha = 0.8;
+        ctx.strokeStyle = active ? 'rgba(0,90,200,1)' : 'rgba(0,0,0,0.35)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, w, h);
+
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.font = `${14 * (window.devicePixelRatio || 1)}px ui-monospace,monospace`;
+        ctx.fillText(key.toUpperCase(), x + 8, y + 18);
+        ctx.restore();
+      });
+    }
 
     ctx.restore();
   }
 
+  function drawSafeOverlay() {
+    if (!ctx) return;
+
+    const key = getActiveZoneKey?.() || 'front';
+    const z = zones?.[key];
+    if (!z || tplW <= 0 || tplH <= 0) return;
+
+    const safe = getSafeRectRel(key, printZoneCM);
+
+    const zoneX = tplX + z.uMin * tplW;
+    const zoneY = tplY + (1 - z.vMax) * tplH;
+    const zoneW = (z.uMax - z.uMin) * tplW;
+    const zoneH = (z.vMax - z.vMin) * tplH;
+
+    const safeX = zoneX + safe.uMin * zoneW;
+    const safeY = zoneY + safe.vMin * zoneH;
+    const safeW = (safe.uMax - safe.uMin) * zoneW;
+    const safeH = (safe.vMax - safe.vMin) * zoneH;
+
+    ctx.save();
+
+    ctx.globalAlpha = 0.10;
+    ctx.fillStyle = 'black';
+    ctx.fillRect(zoneX, zoneY, zoneW, safeY - zoneY);
+    ctx.fillRect(zoneX, safeY + safeH, zoneW, (zoneY + zoneH) - (safeY + safeH));
+    ctx.fillRect(zoneX, safeY, safeX - zoneX, safeH);
+    ctx.fillRect(safeX + safeW, safeY, (zoneX + zoneW) - (safeX + safeW), safeH);
+
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(0,170,90,1)';
+    ctx.strokeRect(safeX, safeY, safeW, safeH);
+
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = 'rgba(0,170,90,1)';
+    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ui-monospace,monospace`;
+    ctx.fillText('SAFE AREA', safeX + 8, safeY + 16);
+
+    ctx.restore();
+  }
+
+  // placement (zone-local 0..1) -> canvas px
   function placementToCanvas(p) {
-    const cw = artCanvas.width, ch = artCanvas.height;
-    const cx = p.u * cw, cy = (1 - p.v) * ch;
-    const dw = p.uScale * cw, dh = p.vScale * ch;
-    return { cx, cy, dw, dh };
+    const key = getActiveZoneKey?.() || 'front';
+    const z = zones?.[key];
+
+    if (!z) {
+      const c = uvToCanvasPx(p.u, p.v);
+      const dw = p.uScale * tplW;
+      const dh = p.vScale * tplW;
+      return { cx: c.x, cy: c.y, dw, dh };
+    }
+
+    // zone local -> abs uv
+    const uAbs = z.uMin + p.u * (z.uMax - z.uMin);
+    const vAbs = z.vMin + p.v * (z.vMax - z.vMin); // UV up
+    const c = uvToCanvasPx(uAbs, vAbs);
+
+    const zoneWpx = (z.uMax - z.uMin) * tplW;
+    const dw = p.uScale * zoneWpx;
+    const dh = p.vScale * zoneWpx;
+
+    return { cx: c.x, cy: c.y, dw, dh };
   }
 
   function drawEditor() {
-    if (!ctx || !artCanvas) return;
-    ctx.clearRect(0, 0, artCanvas.width, artCanvas.height);
+    if (!ctx) return;
+
+    resizeCanvasDPR();
     drawBackdrop();
+
+    // safe overlay (artwork-аас доор)
+    drawSafeOverlay();
 
     const p = artworkCtrl.getPlacement?.();
     const img = artworkCtrl.getImage?.();
     if (!p || !img) return;
 
+    const key = getActiveZoneKey?.() || 'front';
+    const z = zones?.[key];
+
     const { cx, cy, dw, dh } = placementToCanvas(p);
 
-    ctx.save();
-    ctx.translate(edPan.x * (window.devicePixelRatio || 1), edPan.y * (window.devicePixelRatio || 1));
-    ctx.scale(edScale, edScale);
+    // zone rect (template space) for clip + warning
+    let zoneX = 0, zoneY = 0, zoneW = artCanvas.width, zoneH = artCanvas.height;
+    if (z && tplW > 0 && tplH > 0) {
+      zoneX = tplX + z.uMin * tplW;
+      zoneY = tplY + (1 - z.vMax) * tplH;
+      zoneW = (z.uMax - z.uMin) * tplW;
+      zoneH = (z.vMax - z.vMin) * tplH;
+    }
 
+    // CLIP: artwork zone-оос гадуур харагдахгүй
     ctx.save();
+    ctx.beginPath();
+    ctx.rect(zoneX, zoneY, zoneW, zoneH);
+    ctx.clip();
+
     ctx.translate(cx, cy);
     ctx.rotate(p.rotationRad || 0);
-
     ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
 
-    // selection border
     ctx.strokeStyle = 'rgba(17,24,39,0.9)';
-    ctx.lineWidth = 1 * (window.devicePixelRatio || 1);
+    ctx.lineWidth = 2;
     ctx.strokeRect(-dw / 2, -dh / 2, dw, dh);
 
     ctx.restore();
-    ctx.restore();
-  }
 
-  function clientToLocal(e) {
-    const rect = artCanvas.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
-  }
+    // WARNING if outside safe
+    const safe = getSafeRectRel(key, printZoneCM);
+    const ok = isPlacementInsideSafe(p, safe);
 
-  // === Overlay Box (3D талын HTML control) — 3D canvas‑ын офсеттай ===
-  function updateOverlayBox() {
-    if (!overlayBox) return;
+    if (!ok) {
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = 'rgba(255,0,0,1)';
+      ctx.fillRect(zoneX, zoneY, zoneW, zoneH);
+      ctx.restore();
 
-    const pose = getPose();
-    const p = artworkCtrl.getPlacement?.();
-    if (!p || !pose) {
-      overlayBox.style.display = 'none';
-      return;
-    }
-
-    const center = worldToScreen(pose.position, camera, canvas3D);
-    const rect3d = canvas3D.getBoundingClientRect(); // офсет
-
-    // orientation (base + user rotation)
-    const final = pose.baseOrientation.clone();
-    final.z += (p.rotationRad || 0);
-    const q = new THREE.Quaternion().setFromEuler(final);
-
-    const { w, h } = getDecalSize();
-    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
-    const up    = new THREE.Vector3(0, 1, 0).applyQuaternion(q).normalize();
-
-    const halfRightW = pose.position.clone().add(right.multiplyScalar(w * 0.5));
-    const halfUpW    = pose.position.clone().add(up.multiplyScalar(h * 0.5));
-
-    const rightPx = worldToScreen(halfRightW, camera, canvas3D);
-    const upPx    = worldToScreen(halfUpW,    camera, canvas3D);
-
-    const halfW = Math.hypot(rightPx.x - center.x, rightPx.y - center.y);
-    const halfH = Math.hypot(upPx.x    - center.x, upPx.y    - center.y);
-
-    const pxW = Math.max(60, halfW * 2);
-    const pxH = Math.max(60, halfH * 2);
-
-    overlayBox.style.display = 'block';
-    overlayBox.style.left = `${rect3d.left + center.x - pxW / 2}px`;
-    overlayBox.style.top  = `${rect3d.top  + center.y - pxH / 2}px`;
-    overlayBox.style.width  = `${pxW}px`;
-    overlayBox.style.height = `${pxH}px`;
-    overlayBox.style.transformOrigin = '50% 50%';
-    overlayBox.style.transform = `rotate(${p.rotationRad || 0}rad)`;
-
-    // handle sizes
-    const handlePx = clamp(Math.min(pxW, pxH) * 0.10, 10, 22);
-    const { hTL, hTR, hBL, hBR } = handles || {};
-    if (hTL && hTR && hBL && hBR) {
-      [hTL, hTR, hBL, hBR].forEach(hh => {
-        hh.style.width = `${handlePx}px`;
-        hh.style.height = `${handlePx}px`;
-        hh.style.borderRadius = `${Math.round(handlePx * 0.45)}px`;
-      });
-      const off = Math.round(handlePx * 0.55);
-      hTL.style.left = `${-off}px`;  hTL.style.top = `${-off}px`;
-      hTR.style.right = `${-off}px`; hTR.style.top = `${-off}px`;
-      hBL.style.left = `${-off}px`;  hBL.style.bottom = `${-off}px`;
-      hBR.style.right = `${-off}px`; hBR.style.bottom = `${-off}px`;
+      if (hud && !hud.textContent.includes('Outside SAFE')) {
+        hud.textContent += `\n⚠ Outside SAFE AREA`;
+      }
     }
   }
 
-  // === Editor events ===
- // === Editor events ===
-function bindEditorEvents() {
-  // --- 2D drag state (✅ нэг газар shared state) ---
-  let isDragging2D = false;
-  let grabOffsetU = 0;
-  let grabOffsetV = 0;
+  function bindEditorEvents() {
+    let dragging2D = false;
 
-  function getUVFromEvent(e) {
-    // event -> canvas local (CSS px)
-    const loc = clientToLocal(e);
+    function getCanvasXY(e) {
+      const r = artCanvas.getBoundingClientRect();
+      const x = (e.clientX - r.left) * (artCanvas.width / r.width);
+      const y = (e.clientY - r.top) * (artCanvas.height / r.height);
+      return { x, y };
+    }
 
-    // pan/zoom-г тайлж "canvas coordinate" (px) болгож хөрвүүлэх
-    const inv = 1 / edScale;
-    const x = (loc.x - edPan.x) * inv;
-    const y = (loc.y - edPan.y) * inv;
+    // ✅ A) canvas px -> placement (0..1) (active zone-оор)  (template contain ашиглана)
+    function canvasToPlacement(x, y) {
+      const key = getActiveZoneKey?.() || 'front';
+      const z = zones?.[key];
 
-    // canvas px -> normalized u,v
-    let u = x / artCanvas.width;
-    let v = 1 - (y / artCanvas.height);
+      // canvas px -> abs UV
+      const { u: uAbs, v: vAbs } = canvasPxToAbsUV(x, y);
 
-    // clamp
-    u = Math.min(1, Math.max(0, u));
-    v = Math.min(1, Math.max(0, v));
-    return { u, v };
-  }
+      if (!z) return { u: uAbs, v: vAbs };
 
-  function applySnapAndSet(p, e) {
-    const sn = readSnapUI();
-    const snapped = applySnap(p, {
-      enableCenterSnap: sn.enableCenter,
-      enableGridSnap: sn.enableGrid,
-      gridCm: sn.gridCm,
-      printZoneCM,
-      shiftToDisable: true,
-      shiftKey: e.shiftKey,
+      // abs UV -> zone-relative (0..1)
+      const uRel = (uAbs - z.uMin) / Math.max(1e-6, (z.uMax - z.uMin));
+      //const vRel = (z.vMax - vAbs) / Math.max(1e-6, (z.vMax - z.vMin)); // ✅ зөв flip
+      const vRel = (vAbs - z.vMin) / Math.max(1e-6, (z.vMax - z.vMin));
+      return {
+        u: clamp(uRel, 0, 1),
+        v: clamp(vRel, 0, 1),
+      };
+    }
+
+    function isPointInsideArtwork(x, y) {
+      const p = artworkCtrl.getPlacement?.();
+      if (!p) return false;
+      const box = placementToCanvas(p); // {cx,cy,dw,dh}
+      const left = box.cx - box.dw / 2;
+      const top = box.cy - box.dh / 2;
+      return (x >= left && x <= left + box.dw && y >= top && y <= top + box.dh);
+    }
+
+    // ✅ B) placement-ийг zone дотроос гаргахгүй clamp
+    function clampPlacementInsideZone(p) {
+      const halfW = p.uScale * 0.5;
+      const halfH = p.vScale * 0.5;
+
+      p.u = clamp(p.u, 0 + halfW, 1 - halfW);
+      p.v = clamp(p.v, 0 + halfH, 1 - halfH);
+      return p;
+    }
+
+    // 2D drag MOVE
+    artCanvas.addEventListener('pointerdown', (e) => {
+      // NOTE: isLocked энд scope-д байхгүй байж магадгүй.
+      // main.js дээр lock хийж байгаа бол opts-оор isLocked getter дамжуулах нь хамгийн зөв.
+      if (!artworkCtrl.hasPlacement?.()) return;
+
+      const { x, y } = getCanvasXY(e);
+      if (!isPointInsideArtwork(x, y)) return;
+
+      e.preventDefault();
+      artCanvas.setPointerCapture?.(e.pointerId);
+      dragging2D = true;
     });
-    artworkCtrl.setPlacement(snapped);
-  }
 
-  function placeFromClient(e) {
-    const { u, v } = getUVFromEvent(e);
+    artCanvas.addEventListener('pointermove', (e) => {
+      if (!dragging2D) return;
 
-    const p =
-      artworkCtrl.getPlacement() ||
-      { u: 0.5, v: 0.5, uScale: 0.3, vScale: 0.3, rotationRad: 0 };
+      const { x, y } = getCanvasXY(e);
+      const rel = canvasToPlacement(x, y);
 
-    p.u = u;
-    p.v = v;
+      const p = artworkCtrl.getPlacement();
+      if (!p) return;
 
-    applySnapAndSet(p, e);
-    onApplyDecalFromPose();
-    drawEditor();
-  }
+      p.u = rel.u;
+      p.v = rel.v;
 
-  function stopDrag(e) {
-    isDragging2D = false;
-    edDragging = false;
-    edPanning = false;
+      // ✅ zone дотроо барина (wrap бүр мөсөн зогсоно)
+      clampPlacementInsideZone(p);
 
-    if (e?.pointerId != null) {
-      try { artCanvas.releasePointerCapture(e.pointerId); } catch {}
-    }
-  }
+      // ✅ optional: safe area дотроо барих
+      // const key = getActiveZoneKey?.() || 'front';
+      // const safe = getSafeRectRel(key, printZoneCM);
+      // clampPlacementToSafe(p, safe);
 
-  // -----------------------
-  // pointerdown
-  // -----------------------
-  artCanvas?.addEventListener('pointerdown', (e) => {
-    if (!artworkCtrl.hasImage()) return;
+      artworkCtrl.setPlacement(p);
 
-    // ✅ pointerup алдагдахаас хамгаална
-    artCanvas.setPointerCapture(e.pointerId);
+      // 3D sync
+      onApplyDecalFromPose?.();
 
-    // pan mode (space / middle / right)
-    if (spaceHeld || e.button === 1 || e.button === 2) {
-      edPanning = true;
-      e.preventDefault();
-      return;
-    }
-
-    // ---- LEFT CLICK ----
-    // 1) хэрэв placement байхгүй бол: нэг удаа байрлуулна
-    if (!artworkCtrl.hasPlacement()) {
-      edDragging = true;
-      placeFromClient(e); // click placement
-      // drag эхлүүлэхгүй (байрлуулж дуусаад зогсоно)
-      stopDrag(e);
-      return;
-    }
-
-    // 2) placement байгаа бол: "drag to move"
-    const { u, v } = getUVFromEvent(e);
-    const p = artworkCtrl.getPlacement();
-
-    // ✅ mouse дарсан цэг төвөөс хэдэн u/v зөрүүтэйг хадгална
-    grabOffsetU = u - p.u;
-    grabOffsetV = v - p.v;
-
-    isDragging2D = true;
-    edDragging = true;
-
-    e.preventDefault();
-  });
-
-  // -----------------------
-  // pointermove
-  // -----------------------
-  window.addEventListener('pointermove', (e) => {
-    // ✅ товч суллагдсан мөртлөө move ирвэл drag-аа унтраана
-    if (isDragging2D && e.buttons === 0) {
-      stopDrag(e);
-      return;
-    }
-
-    if (edPanning) {
-      e.preventDefault();
-      edPan.x += e.movementX;
-      edPan.y += e.movementY;
+      // 2D redraw
       drawEditor();
-      return;
-    }
+    });
 
-    if (!isDragging2D) return;
+    window.addEventListener('pointerup', () => {
+      dragging2D = false;
+    });
+  }
 
-    const { u, v } = getUVFromEvent(e);
-    const p = artworkCtrl.getPlacement();
-    if (!p) return;
-
-    p.u = u - grabOffsetU;
-    p.v = v - grabOffsetV;
-
-    // clamp
-    p.u = Math.min(1, Math.max(0, p.u));
-    p.v = Math.min(1, Math.max(0, p.v));
-
-    applySnapAndSet(p, e);
-    onApplyDecalFromPose();
-    drawEditor();
-  });
-
-  // -----------------------
-  // pointerup/cancel
-  // -----------------------
-  window.addEventListener('pointerup', (e) => stopDrag(e));
-  window.addEventListener('pointercancel', (e) => stopDrag(e));
-  window.addEventListener('blur', () => { isDragging2D = false; edDragging = false; edPanning = false; });
-
-  // Wheel = zoom to cursor
-  artCanvas?.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const rect = artCanvas.getBoundingClientRect();
-    const loc = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    const old = edScale;
-    const k = (e.deltaY > 0) ? 0.9 : 1.1;
-    edScale = Math.max(0.2, Math.min(5, edScale * k));
-
-    const wx = (loc.x - edPan.x) / old;
-    const wy = (loc.y - edPan.y) / old;
-    edPan.x = loc.x - wx * edScale;
-    edPan.y = loc.y - wy * edScale;
-
-    drawEditor();
-  }, { passive: false });
-
-  // Keyboard: space = pan, E/R rotate
-  window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space') spaceHeld = true;
-    if (artworkCtrl.hasPlacement()) {
-      if (e.key.toLowerCase() === 'e') { artworkCtrl.rotateByDeg(-5); onApplyDecalFromPose(); drawEditor(); }
-      if (e.key.toLowerCase() === 'r') { artworkCtrl.rotateByDeg( 5); onApplyDecalFromPose(); drawEditor(); }
-    }
-  });
-  window.addEventListener('keyup', (e) => { if (e.code === 'Space') spaceHeld = false; });
-
-  // Initial + responsive
   resizeCanvasDPR();
   window.addEventListener('resize', () => { resizeCanvasDPR(); drawEditor(); });
-}
-
 
   bindEditorEvents();
+  drawEditor();
 
   return {
     drawEditor,
-    updateOverlayBox,
-    /** Width (cm) тохируулах + ratio хадгална */
+    updateOverlayBox: () => {}, // (чи өмнөх updateOverlayBox-оо энд оруулж болно)
     applyWidthCm(widthCm) {
       const p = artworkCtrl.getPlacement();
       const img = artworkCtrl.getImage();
       if (!p || !img) return;
+
       p.uScale = cmToPlacementWidth(widthCm, printZoneCM);
       const ratio = img.height / Math.max(1e-6, img.width);
       p.vScale = clamp(p.uScale * ratio, 0.05, 1.2);
+
       artworkCtrl.setPlacement(p);
-      onApplyDecalFromPose();
+      onApplyDecalFromPose?.();
       drawEditor();
     },
   };

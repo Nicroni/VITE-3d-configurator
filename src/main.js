@@ -1,6 +1,4 @@
-
 // src/main.js
-//console.log('[BOOT] main.js loaded', import.meta.url);
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -16,19 +14,24 @@ import { setupUVEditor } from './editor/uvCanvas.js';
 
 import { buildPrintZoneFromMesh, isUVInsidePrintZone } from './zones/zoneDetector.js';
 import { uvToPrintCM } from './zones/zoneMetrics.js';
+import { pickOnMeshByUV } from './zones/uvPick.js';
 
-import { createDecalMaterial, setArtworkTextureFromImage, hasArtworkTexture } from './decal/decalMaterial.js';
+import {
+  createDecalMaterial,
+  setArtworkTextureFromImage,
+  hasArtworkTexture
+} from './decal/decalMaterial.js';
+
 import { buildPoseFromHit } from './decal/decalPose.js';
 import { buildDecalMesh, disposeDecalMesh } from './decal/decalBuilder.js';
 
 import { bakeTemplatePNGAndJSON } from './print/exportPNG.js';
-
 import { loadImageFromFile } from './utils/image.js';
 import { downloadDataURL, downloadText } from './utils/download.js';
 
 import { ZONE_CM } from './config/printZones.js';
-import { pickOnMeshByUV } from './zones/uvPick.js';
 import { DEFAULT_DPI, DEFAULT_TEMPLATE_PX, DECAL_DEPTH, WORLD_ZONE_W } from './config/constants.js';
+import { getSafeRectRel, isPlacementInsideSafe, clampPlacementToSafe } from './editor/safeZone.js';
 
 // --------------------
 // DOM
@@ -39,6 +42,12 @@ const fileInput = document.getElementById('file');
 const btnSubmit = document.getElementById('btnSubmit');
 const btnEdit = document.getElementById('btnEdit');
 const overlayBox = document.getElementById('overlayBox');
+const zoneLabel = document.getElementById('zoneLabel');
+
+const btnZoneFront = document.getElementById('zoneFront');
+const btnZoneBack = document.getElementById('zoneBack');
+const btnZoneLeftArm = document.getElementById('zoneLeftArm');
+const btnZoneRightArm = document.getElementById('zoneRightArm');
 
 const chkSnapCenter = document.getElementById('chkSnapCenter');
 const chkSnapGrid = document.getElementById('chkSnapGrid');
@@ -48,6 +57,9 @@ const btnApplyCm = document.getElementById('btnApplyCm');
 
 const viewer3d = document.getElementById('viewer3d');
 if (!viewer3d) throw new Error('#viewer3d not found');
+
+const artCanvas = document.getElementById('artCanvas');
+const artViewport = document.getElementById('artViewport');
 
 // overlay handles
 const hTL = overlayBox ? overlayBox.querySelector('.tl') : null;
@@ -64,101 +76,97 @@ initScene({
   aspect: viewer3d.clientWidth / Math.max(1, viewer3d.clientHeight),
 });
 
+const { scene, camera } = getContext();
+const { renderer, canvas } = createRenderer(viewer3d, { alpha: false });
 
-let _modelBox = null;     // Box3 cache
-let _modelSize = null;    // Vector3 cache
-let _modelCenter = null;  // Vector3 cache
+if ('outputColorSpace' in renderer) {
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+} else {
+  // eslint-disable-next-line
+  renderer.outputEncoding = THREE.sRGBEncoding;
+}
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+
+const controls = createControls(camera, canvas);
+setControlMode('EDIT');
+
+// --------------------
+// Model fit helpers
+// --------------------
+let _modelBox = null;
+let _modelSize = null;
+let _modelCenter = null;
 
 function fitCameraToModel(framing = 1.35) {
   if (!_modelBox || !_modelSize) return;
 
-  // Хэрвээ чи tshirtRoot.position.sub(_modelCenter) хийсэн бол
-  // model-ийн төв нь (0,0,0) болсон гэсэн үг.
   const center = new THREE.Vector3(0, 0, 0);
-
   const maxDim = Math.max(_modelSize.x, _modelSize.y, _modelSize.z);
 
-  // Fit distance (vertical + horizontal)
   const fov = THREE.MathUtils.degToRad(camera.fov);
   const fitHeightDistance = (maxDim / 2) / Math.tan(fov / 2);
   const fitWidthDistance = fitHeightDistance / Math.max(1e-6, camera.aspect);
-
   const dist = framing * Math.max(fitHeightDistance, fitWidthDistance);
 
-  // Камерыг model-ийн яг төв рүү харуулна
   controls.target.copy(center);
-
-  // Камерыг төвөөс арагш байрлуулна (z тэнхлэгээр)
   camera.position.set(center.x, center.y, center.z + dist);
 
   camera.near = Math.max(0.01, dist / 100);
-  camera.far  = dist * 100;
+  camera.far = dist * 100;
   camera.updateProjectionMatrix();
   controls.update();
 }
 
-
-const { scene, camera } = getContext();
-
-const { renderer, canvas } = createRenderer(viewer3d, { alpha: false });
 function handleResize() {
   const rect = viewer3d.getBoundingClientRect();
   if (rect.width < 10 || rect.height < 10) return;
   resizeRendererToElement(renderer, viewer3d);
   camera.aspect = rect.width / Math.max(1, rect.height);
   camera.updateProjectionMatrix();
-
-  // ✅ model бэлэн + хэмжээс OK үед л fit хийнэ
- if (_modelBox && _modelSize && _modelCenter) {
-    fitCameraToModel(1.35);
-  }
-
+  if (_modelBox && _modelSize && _modelCenter) fitCameraToModel(1.35);
 }
-
 handleResize();
 window.addEventListener('resize', handleResize);
-// ✅ viewer3d-ийн хэмжээ layout-оос болж өөрчлөгдөх үед ч автоматаар resize хийх
-const ro = new ResizeObserver(() => handleResize());
-ro.observe(viewer3d);
-
-
-// (optional) color space / pixel ratio
-if ('outputColorSpace' in renderer) {
-  renderer.outputColorSpace = THREE.SRGBColorSpace; // r152+
-} else {
-  renderer.outputEncoding = THREE.sRGBEncoding;     // r151-
-}
-renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-
-const controls = createControls(camera, canvas);
-setControlMode('EDIT'); // EDIT үед wheel-ийг artwork scale-д ашиглана
+new ResizeObserver(handleResize).observe(viewer3d);
 
 // --------------------
-// State
+// Global State
 // --------------------
+const productKey = 'tshirt';
+
+const ZONE_MESH_NAMES = {
+  front: 'PRINT_ZONE_FRONT',
+  back: 'PRINT_ZONE_BACK',
+  left_arm: 'PRINT_ZONE_LEFT_ARM',
+  right_arm: 'PRINT_ZONE_RIGHT_ARM',
+};
+
 let tshirtRoot = null;
-let zoneMesh = null;
-let printZone = null;
-let WORLD_ZONE_W_DYNAMIC = WORLD_ZONE_W; // fallback (constants.js-оос)
 
+let zones = {};              // { front:{uMin..}, back:{..} ... }
+let activeZoneKey = 'front';
+let zoneMesh = null;         // active zone mesh
+let printZone = null;        // active zone rect in UV
 
+let printZoneCM = (ZONE_CM?.[productKey]?.[activeZoneKey]) || { width: 30, height: 40 };
+
+// decal sizing base (world units)
+let WORLD_ZONE_W_DYNAMIC = WORLD_ZONE_W;
+
+// decal state
 let decalMesh = null;
-let decalPose = null; // { object, position, baseOrientation }
+let decalPose = null;
 
 let isLocked = false;
 let isDragging = false;
 
-// decal size in world units
 let decalW = 0.25;
 let decalH = 0.25;
 
-const productKey = 'tshirt';
-const sideKey = 'front';
-const printZoneCM = ZONE_CM[productKey][sideKey];
-const dpi = DEFAULT_DPI;
-const templatePx = DEFAULT_TEMPLATE_PX;
+// editor instance
+let editor = null;
 
-// --- throttle for decal rebuild (fps-д ээлтэй) ---
+// throttle for decal rebuild
 let decalBuildRaf = 0;
 function scheduleDecalRebuild() {
   if (decalBuildRaf) return;
@@ -168,108 +176,48 @@ function scheduleDecalRebuild() {
   });
 }
 
-// artwork/material
+// --------------------
+// Artwork / material
+// --------------------
+const { material: decalMat } = createDecalMaterial(renderer);
+
+function redraw2D() {
+  if (!editor) return;
+  editor.drawEditor?.();
+  editor.updateOverlayBox?.();
+}
+
 const artworkCtrl = createArtworkController({
-  onUpdate: (evt) => {
-    // ✅ Scale/rotate/position — ямар ч update дээр 3D-г синкдэнэ
-    const poseOK = updatePoseFromPlacementUV(); // pose өөрчлөгдөөгүй байж болно (scale үед)
-    if (artworkCtrl.hasImage() && (decalPose || poseOK)) {
-      scheduleDecalRebuild(); // geometry-г дахин байгуулах (size/rotation өөрчлөгдөнө)
-    }
+  onUpdate: () => {
+    // editor байхгүй үед redraw хийхгүй
+    redraw2D();
+
+    const poseOK = updatePoseFromPlacementUV();
+    if (artworkCtrl.hasImage() && (decalPose || poseOK)) scheduleDecalRebuild();
   }
 });
-const { material: decalMat } = createDecalMaterial(renderer);
 
 // --------------------
 // Helpers
 // --------------------
-function syncDecalWHFromPlacement() {
-  const p = artworkCtrl.getPlacement();
-  const img = artworkCtrl.getImage();
-  if (!p || !img) return;
- const w = p.uScale * WORLD_ZONE_W_DYNAMIC;   // ✅ энд л ашиглана
-  const ratio = img.height / Math.max(1e-6, img.width);
-  const h = w * ratio;
-  decalW = Math.min(1.5, Math.max(0.05, w));
-  decalH = Math.min(1.5, Math.max(0.05, h));
-}
-
-// Canvas(top->down) харьцангуй (p.u, p.v) -> absolute UV(bottom->up)
-function relToAbsUV(pu, pv, rect) {
-  const u = rect.uMin + pu * (rect.uMax - rect.uMin);
-  // 🔁 FLIP V: Canvas(top→down) -> UV(bottom→up)
-  const v = rect.vMax - pv * (rect.vMax - rect.vMin);
-  const EPS = 1e-4;
-  const uC = Math.min(1 - EPS, Math.max(EPS, u));
-  const vC = Math.min(1 - EPS, Math.max(EPS, v));
-  return new THREE.Vector2(uC, vC);
-}
-
-// Ойролцоох жижиг grid fallback (хоосон UV цэгийн үед)
-function findHitWithFallback(targetMesh, prefUV, rect) {
-  // 0) Шууд prefUV дээр
-  let hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv' });
-  if (!hit) hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv2' });
-  if (hit) return hit;
-
-  // 1) Жижиг grid (5x5), төвөөс гадагш
-  const STEPS = [0, 1, -1, 2, -2];
-  const STEP = 0.04; // printZone доторх харьцангуй алхам
-
-  // prefUV -> relative (0..1)
-  const uRel0 = (prefUV.x - printZone.uMin) / (printZone.uMax - printZone.uMin);
-  const vRel0 = (prefUV.y - printZone.vMin) / (printZone.vMax - printZone.vMin);
-
-  for (const dy of STEPS) {
-    for (const dx of STEPS) {
-      if (dx === 0 && dy === 0) continue;
-      const pu = Math.min(1, Math.max(0, uRel0 + dx * STEP));
-      const pv = Math.min(1, Math.max(0, vRel0 + dy * STEP));
-      const uv = relToAbsUV(pu, pv, rect);
-
-      let h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv' });
-      if (!h) h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv2' });
-      if (h) return h;
-    }
-  }
-  return null;
-}
-
-// 2D placement (0..1) -> absolute UV -> world pose шинэчлэх
-function updatePoseFromPlacementUV() {
-  if (!printZone) { return false; }
-
-  // Target: эхлээд zoneMesh, дараа нь decalPose.object
-  const target = (zoneMesh?.isMesh ? zoneMesh : null) || (decalPose?.object?.isMesh ? decalPose.object : null);
-  if (!target) { return false; }
-
+function clampPlacementNow() {
   const p = artworkCtrl.getPlacement?.();
-  if (!p) { return false; }
+  if (!p) return false;
 
-  const prefUV = relToAbsUV(p.u, p.v, printZone);
+  const key = activeZoneKey || 'front';
+  const safe = getSafeRectRel(key, printZoneCM);
 
-  // 1) uv -> 2) uv2 -> 3) grid fallback
-  let hit = pickOnMeshByUV(target, prefUV, { uvAttr: 'uv' });
-  if (!hit) hit = pickOnMeshByUV(target, prefUV, { uvAttr: 'uv2' });
-  if (!hit) hit = findHitWithFallback(target, prefUV, printZone);
+  // хэмжээс их байвал safe-ээс том байх тохиолдолд “зөөлөн” багасгаж багтаая
+  const maxUS = Math.max(1e-6, safe.uMax - safe.uMin);
+  const maxVS = Math.max(1e-6, safe.vMax - safe.vMin);
+  p.uScale = Math.min(p.uScale, maxUS);
+  p.vScale = Math.min(p.vScale, maxVS);
 
-  if (!hit) return false;
-
-  const pose = buildPoseFromHit(hit);
-  if (!pose) return false;
-
-  decalPose = pose;
+  clampPlacementToSafe(p, safe);
+  artworkCtrl.setPlacement(p);
   return true;
 }
 
-// DevTools хурдан тест
-window.__testUVPick = () => {
-  if (!zoneMesh || !printZone) return console.warn('no zoneMesh/printZone');
-  const u = 0.5 * (printZone.uMin + printZone.uMax);
-  const v = 0.5 * (printZone.vMin + printZone.vMax);
-  const hit = pickOnMeshByUV(zoneMesh, new THREE.Vector2(u, v));
-  console.log('uv=', u.toFixed(3), v.toFixed(3), 'hit=', !!hit, hit);
-};
 
 function readSnapUI() {
   return {
@@ -279,11 +227,108 @@ function readSnapUI() {
   };
 }
 
+function syncDecalWHFromPlacement() {
+  const p = artworkCtrl.getPlacement();
+  const img = artworkCtrl.getImage();
+  if (!p || !img) return;
+
+  const w = p.uScale * WORLD_ZONE_W_DYNAMIC;
+  const ratio = img.height / Math.max(1e-6, img.width);
+  const h = w * ratio;
+
+  decalW = Math.min(1.5, Math.max(0.05, w));
+  decalH = Math.min(1.5, Math.max(0.05, h));
+}
+
+// placement (top->down) -> absolute UV (bottom->up)
+function relToAbsUV(pu, pv, rect) {
+  const u = rect.uMin + pu * (rect.uMax - rect.uMin);
+  const v = rect.vMax - pv * (rect.vMax - rect.vMin);
+
+  const EPS = 1e-4;
+  const uC = Math.min(1 - EPS, Math.max(EPS, u));
+  const vC = Math.min(1 - EPS, Math.max(EPS, v));
+  return new THREE.Vector2(uC, vC);
+}
+
+function findHitWithFallback(targetMesh, prefUV) {
+  let hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv' });
+  if (!hit) hit = pickOnMeshByUV(targetMesh, prefUV, { uvAttr: 'uv2' });
+  if (hit) return hit;
+
+  if (!printZone) return null;
+
+  const STEPS = [0, 1, -1, 2, -2];
+  const STEP = 0.04;
+
+  const uRel0 = (prefUV.x - printZone.uMin) / (printZone.uMax - printZone.uMin);
+  const vRel0 = (prefUV.y - printZone.vMin) / (printZone.vMax - printZone.vMin);
+
+  for (const dy of STEPS) {
+    for (const dx of STEPS) {
+      if (dx === 0 && dy === 0) continue;
+      const pu = Math.min(1, Math.max(0, uRel0 + dx * STEP));
+      const pv = Math.min(1, Math.max(0, vRel0 + dy * STEP));
+      const uv = relToAbsUV(pu, pv, printZone);
+
+      let h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv' });
+      if (!h) h = pickOnMeshByUV(targetMesh, uv, { uvAttr: 'uv2' });
+      if (h) return h;
+    }
+  }
+  return null;
+}
+
+function updatePoseFromPlacementUV() {
+  if (!printZone) return false;
+  if (!zoneMesh || !zoneMesh.isMesh) return false;   // ✅ ALWAYS use active zone mesh
+
+  const p = artworkCtrl.getPlacement?.();
+  if (!p) return false;
+
+  const prefUV = relToAbsUV(p.u, p.v, printZone);
+
+  // ✅ UV pick ONLY on zoneMesh
+  let hit = pickOnMeshByUV(zoneMesh, prefUV, { uvAttr: 'uv' });
+  if (!hit) hit = pickOnMeshByUV(zoneMesh, prefUV, { uvAttr: 'uv2' });
+  if (!hit) hit = findHitWithFallback(zoneMesh, prefUV);
+  if (!hit) return false;
+
+  const pose = buildPoseFromHit(hit);
+  if (!pose) return false;
+
+  // ✅ CRITICAL: lock pose object to current zoneMesh
+  pose.object = zoneMesh;
+
+  decalPose = pose;
+  return true;
+}
+
+
+function applyDecalFromPose() {
+  if (!decalPose || !artworkCtrl.hasImage() || !hasArtworkTexture()) return;
+
+  syncDecalWHFromPlacement();
+  const rotationRad = (artworkCtrl.getPlacement()?.rotationRad) || 0;
+
+  const mesh = buildDecalMesh(
+    decalPose,
+    { width: decalW, height: decalH, depth: DECAL_DEPTH },
+    rotationRad,
+    decalMat
+  );
+
+  disposeDecalMesh(decalMesh, scene);
+  decalMesh = mesh;
+  scene.add(decalMesh);
+}
+
 // --------------------
 // HUD
 // --------------------
 function renderHUD(hitUV) {
   if (!printZone) return;
+
   const a = artworkCtrl.getPlacement();
   if (!a) {
     hud.textContent = hitUV
@@ -291,8 +336,8 @@ function renderHUD(hitUV) {
       : `Ready.`;
     return;
   }
-  const cm = hitUV ? uvToPrintCM(hitUV, printZone, printZoneCM) : null;
 
+  const cm = hitUV ? uvToPrintCM(hitUV, printZone, printZoneCM) : null;
   hud.textContent =
 `${hitUV ? `UV: ${hitUV.x.toFixed(3)}, ${hitUV.y.toFixed(3)}` : 'UV: -'}
 ${cm ? `PRINT cm: x=${cm.x_cm?.toFixed(2)}, y=${cm.y_cm?.toFixed(2)}` : ''}
@@ -304,150 +349,7 @@ Mode: ${isLocked ? 'LOCKED' : 'EDIT'} (Shift=snap off | Shift=ratio-lock on resi
 }
 
 // --------------------
-// Decal helpers
-// --------------------
-function applyDecalFromPose() {
-  if (!decalPose || !artworkCtrl.hasImage() || !hasArtworkTexture()) return;
-  syncDecalWHFromPlacement();
-
-  const rotationRad = (artworkCtrl.getPlacement()?.rotationRad) || 0;
-  const mesh = buildDecalMesh(
-    decalPose,
-    { width: decalW, height: decalH, depth: DECAL_DEPTH },
-    rotationRad,
-    decalMat
-  );
-  disposeDecalMesh(decalMesh, scene);
-  decalMesh = mesh;
-  scene.add(decalMesh);
-}
-
-// overlay resize handles (Shift: ratio lock, Alt: uniform)
-let resizingCorner = null;
-let resizeStart = null; // { x,y, uScale,vScale, ratio }
-function beginResize(corner, e) {
-  if (isLocked) return;
-  if (!artworkCtrl.hasPlacement() || !decalPose) return;
-
-  e.preventDefault();
-  e.stopPropagation();
-  resizingCorner = corner;
-
-  const p = artworkCtrl.getPlacement();
-  resizeStart = {
-    x: e.clientX,
-    y: e.clientY,
-    uScale: p.uScale,
-    vScale: p.vScale,
-    ratio: p.vScale / Math.max(1e-6, p.uScale),
-  };
-  controls.enabled = false;
-}
-
-function bindOverlayHandles() {
-  const map = { hTL, hTR, hBL, hBR };
-  Object.entries(map).forEach(([key, el]) => {
-    if (!el) return;
-    el.addEventListener('pointerdown', (e) => {
-      const corner = key.replace('h', '').toLowerCase(); // tl/tr/bl/br
-      beginResize(corner, e);
-    });
-  });
-
-  window.addEventListener('pointermove', (e) => {
-    if (!resizingCorner || !resizeStart) return;
-
-    let dx = e.clientX - resizeStart.x;
-    let dy = e.clientY - resizeStart.y;
-
-    if (resizingCorner === 'tl' || resizingCorner === 'bl') dx = -dx;
-    if (resizingCorner === 'bl' || resizingCorner === 'br') dy = -dy;
-
-    const k = 0.0015;
-    let sx = Math.min(5, Math.max(0.2, 1 + dx * k));
-    let sy = Math.min(5, Math.max(0.2, 1 + dy * k));
-
-    const p = artworkCtrl.getPlacement();
-    if (!p) return;
-
-    if (e.shiftKey) { // ratio lock
-      const r = resizeStart.ratio || (resizeStart.vScale / Math.max(1e-6, resizeStart.uScale));
-      sy = sx * r;
-    }
-    if (e.altKey) { // uniform
-      const uni = (sx + sy) * 0.5;
-      sx = sy = uni;
-    }
-
-    p.uScale = Math.min(1.2, Math.max(0.05, resizeStart.uScale * sx));
-    p.vScale = Math.min(1.2, Math.max(0.05, resizeStart.vScale * sy));
-
-    // setPlacement нэг удаа
-    artworkCtrl.setPlacement(p);
-
-    // Scale-д pose өөрчлөгдөхгүй ч decal-г заавал дахин байгуулна
-    updatePoseFromPlacementUV();
-    scheduleDecalRebuild();
-  });
-
-  window.addEventListener('pointerup', () => {
-    if (!resizingCorner) return;
-    resizingCorner = null;
-    resizeStart = null;
-    controls.enabled = true;
-  });
-}
-bindOverlayHandles();
-
-// --------------------
-// 2D Canvas Editor
-// --------------------
-const artCanvas = document.getElementById('artCanvas');
-const artViewport = document.getElementById('artViewport');
-
-const editor = setupUVEditor({
-  artCanvas,
-  artViewport,
-  overlayBox,
-  handles: { hTL, hTR, hBL, hBR },
-  hud,
-  camera,
-  canvas3D: canvas,
-  printZoneCM,
-  getPose: () => decalPose,
-  getDecalSize: () => ({ w: decalW, h: decalH }),
-  setDecalSize: (w, h) => { decalW = w; decalH = h; },
-  artworkCtrl,
-  readSnapUI,
-
-  // 2D canvas дээрх placement шинэчлэгдсэн үед:
-  onApplyDecalFromPose: () => {
-    updatePoseFromPlacementUV(); // pose байхгүй бол чимээгүй буцаана
-    scheduleDecalRebuild();      // decal-г заавал дахин байгуулах
-  },
-});
-
-// (ШИНЭ) 2D талын wheel-ийг scale-д ашиглах (хүсвэл)
-artViewport?.addEventListener('wheel', (e) => {
-  if (isLocked) return;
-  if (!artworkCtrl.hasPlacement()) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const factor = e.deltaY > 0 ? 0.95 : 1.05;
-  artworkCtrl.scaleBy(factor);
-  scheduleDecalRebuild();
-}, { passive: false });
-
-btnApplyCm?.addEventListener('click', () => {
-  if (isLocked) return;
-  if (!artworkCtrl.hasPlacement()) return;
-  const widthCm = parseFloat(inpWidthCm?.value || '0');
-  if (!widthCm || widthCm <= 0) return;
-  editor.applyWidthCm(widthCm);
-});
-
-// --------------------
-// Lock / Edit buttons
+// Lock / Edit
 // --------------------
 function setLockedState(lock) {
   isLocked = lock;
@@ -478,86 +380,244 @@ btnEdit?.addEventListener('click', () => {
   setLockedState(false);
 });
 
-
-
 // --------------------
-// Load GLB
+// Zone selector
 // --------------------
-const loader = new GLTFLoader();
-loader.load(
-  '/assets/models/TShirt.glb',
-  (gltf) => {
-    tshirtRoot = gltf.scene;
-    scene.add(tshirtRoot);
-    // Fit camera to model (cache + fit)
-_modelBox = new THREE.Box3().setFromObject(tshirtRoot);
-_modelSize = _modelBox.getSize(new THREE.Vector3());
-_modelCenter = _modelBox.getCenter(new THREE.Vector3());
+function setActiveZone(key) {
+  if (!zones?.[key]) {
+    console.warn('[setActiveZone] missing zone rect:', key);
+    return;
+  }
+  activeZoneKey = key;
 
-tshirtRoot.position.sub(_modelCenter);
+  // print cm size update (маш чухал)
+  printZoneCM = (ZONE_CM?.[productKey]?.[activeZoneKey]) || printZoneCM;
 
-// aspect аль хэдийн handleResize дээр шинэчлэгддэг тул
-//fitCameraToModel(1.6);
-fitCameraToModel(1.35);
-handleResize(); // ✅ aspect + size update + if(_modelBox) fit
+  // mesh by name
+  const meshName = ZONE_MESH_NAMES[key];
+  let found = null;
+  tshirtRoot?.traverse(o => { if (o.name === meshName) found = o; });
+  zoneMesh = found;
 
+  // dynamic zone width
+  if (zoneMesh) {
+    const b = new THREE.Box3().setFromObject(zoneMesh);
+    const s = b.getSize(new THREE.Vector3());
+    WORLD_ZONE_W_DYNAMIC = Math.max(s.x, s.z);
+  }
 
-    
+  printZone = zones[key];
 
-    // --- find zone ---
-    let foundZone = null;
-    tshirtRoot.traverse(o => { if (o.name === 'PRINT_ZONE_FRONT') foundZone = o; });
-    zoneMesh = foundZone;
-    // after zoneMesh found
-if (zoneMesh && zoneMesh.isObject3D) {
-  const zoneBox = new THREE.Box3().setFromObject(zoneMesh);
-  const zoneSize = zoneBox.getSize(new THREE.Vector3());
-  WORLD_ZONE_W_DYNAMIC = Math.max(1e-6, zoneSize.x);
-  console.log('[zone] WORLD_ZONE_W_DYNAMIC =', WORLD_ZONE_W_DYNAMIC.toFixed(4));
-} else {
-  console.warn('[zone] PRINT_ZONE_FRONT not found → using fallback WORLD_ZONE_W');
+  if (zoneLabel && printZoneCM) {
+    zoneLabel.textContent = `Print Zone: ${printZoneCM.width} × ${printZoneCM.height} cm (${key})`;
+  }
+
+  // editor refresh
+  if (editor?.setPrintZoneCM) editor.setPrintZoneCM(printZoneCM);
+  redraw2D();
+
+  console.log('[activeZone]', key, 'zoneMesh=', zoneMesh?.name);
 }
 
+btnZoneFront?.addEventListener('click', () => setActiveZone('front'));
+btnZoneBack?.addEventListener('click', () => setActiveZone('back'));
+btnZoneLeftArm?.addEventListener('click', () => setActiveZone('left_arm'));
+btnZoneRightArm?.addEventListener('click', () => setActiveZone('right_arm'));
 
-    // 🔎 Debug: бүх хүүхэд mesh-үүд, UV байгаа эсэх
-    console.group('[zone] scan');
-    tshirtRoot.traverse(o => {
-      if (o.isMesh) {
-        const hasUV = !!o.geometry?.attributes?.uv;
-        const verts = o.geometry?.attributes?.position?.count ?? 0;
-        console.log('  mesh:', o.name, 'hasUV=', hasUV, 'verts=', verts);
-      }
+// --------------------
+// Overlay resize handles
+// --------------------
+let resizingCorner = null;
+let resizeStart = null;
+
+function beginResize(corner, e) {
+  if (isLocked) return;
+  if (!artworkCtrl.hasPlacement() || !decalPose) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  resizingCorner = corner;
+
+  const p = artworkCtrl.getPlacement();
+  resizeStart = {
+    x: e.clientX,
+    y: e.clientY,
+    uScale: p.uScale,
+    vScale: p.vScale,
+    ratio: p.vScale / Math.max(1e-6, p.uScale),
+  };
+  controls.enabled = false;
+}
+
+(function bindOverlayHandles() {
+  const map = { hTL, hTR, hBL, hBR };
+  Object.entries(map).forEach(([key, el]) => {
+    if (!el) return;
+    el.addEventListener('pointerdown', (e) => {
+      const corner = key.replace('h', '').toLowerCase(); // tl/tr/bl/br
+      beginResize(corner, e);
     });
-    console.groupEnd();
+  });
 
-    // 🔎 Debug: сонгосон zone mesh
-    console.log('[zone] selected:', zoneMesh?.name, 'hasUV=', !!zoneMesh?.geometry?.attributes?.uv);
+  window.addEventListener('pointermove', (e) => {
+    if (!resizingCorner || !resizeStart) return;
 
-    if (zoneMesh) {
-      printZone = buildPrintZoneFromMesh(zoneMesh);
-    } else {
-      // fallback UV-рект (zoneMesh олдоогүй тохиолдолд)
-      printZone = { uMin: 0.25, uMax: 0.75, vMin: 0.20, vMax: 0.85, name: 'fallback', side: 'front' };
-      console.warn('[zone] PRINT_ZONE_FRONT not found – using fallback rect', printZone);
+    let dx = e.clientX - resizeStart.x;
+    let dy = e.clientY - resizeStart.y;
+
+    if (resizingCorner === 'tl' || resizingCorner === 'bl') dx = -dx;
+    if (resizingCorner === 'bl' || resizingCorner === 'br') dy = -dy;
+
+    const k = 0.0015;
+    let sx = Math.min(5, Math.max(0.2, 1 + dx * k));
+    let sy = Math.min(5, Math.max(0.2, 1 + dy * k));
+
+    const p = artworkCtrl.getPlacement();
+    if (!p) return;
+
+    if (e.shiftKey) {
+      const r = resizeStart.ratio || (resizeStart.vScale / Math.max(1e-6, resizeStart.uScale));
+      sy = sx * r;
+    }
+    if (e.altKey) {
+      const uni = (sx + sy) * 0.5;
+      sx = sy = uni;
     }
 
-    // 🔎 Debug: printZone UV-рект
-    console.log(
-      '[zone] rect u[', printZone.uMin.toFixed(3), '..', printZone.uMax.toFixed(3),
-      '] v[', printZone.vMin.toFixed(3), '..', printZone.vMax.toFixed(3), ']'
-    );
+    p.uScale = Math.min(1.2, Math.max(0.05, resizeStart.uScale * sx));
+    p.vScale = Math.min(1.2, Math.max(0.05, resizeStart.vScale * sy));
 
-    setLockedState(false);
-    btnEdit && (btnEdit.disabled = true);
-    btnSubmit && (btnSubmit.disabled = true);
+    artworkCtrl.setPlacement(p);
+    updatePoseFromPlacementUV();
+    scheduleDecalRebuild();
+    redraw2D();
+  });
+
+  window.addEventListener('pointerup', () => {
+    if (!resizingCorner) return;
+    resizingCorner = null;
+    resizeStart = null;
+    controls.enabled = true;
+  });
+})();
+
+// --------------------
+// UV template loader
+// --------------------
+function loadTemplateImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+// --------------------
+// 2D wheel scale
+// --------------------
+artViewport?.addEventListener('wheel', (e) => {
+  if (isLocked) return;
+  if (!artworkCtrl.hasPlacement()) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const factor = e.deltaY > 0 ? 0.95 : 1.05;
+  artworkCtrl.scaleBy(factor);
+  clampPlacementNow();
+  redraw2D();
+  scheduleDecalRebuild();
+}, { passive: false });
+
+// Apply width in cm
+btnApplyCm?.addEventListener('click', () => {
+  if (isLocked) return;
+  if (!artworkCtrl.hasPlacement()) return;
+  const widthCm = parseFloat(inpWidthCm?.value || '0');
+  if (!widthCm || widthCm <= 0) return;
+  editor?.applyWidthCm?.(widthCm);
+  redraw2D();
+  scheduleDecalRebuild();
+});
+
+// --------------------
+// Editor init (once)
+// --------------------
+async function initEditorOnce() {
+  if (editor) return editor;
+
+  let uvTemplateImg = null;
+  try {
+    uvTemplateImg = await loadTemplateImage('/assets/uv/tshirt_uv.png');
+  } catch (e) {
+    console.warn('UV template not loaded:', e);
+  }
+
+  editor = setupUVEditor({
+    artCanvas,
+    artViewport,
+    overlayBox,
+    handles: { hTL, hTR, hBL, hBR },
+    hud,
+    camera,
+    canvas3D: canvas,
+
+    printZoneCM,
+    getPose: () => decalPose,
+    getDecalSize: () => ({ w: decalW, h: decalH }),
+    setDecalSize: (w, h) => { decalW = w; decalH = h; },
+
+    artworkCtrl,
+    readSnapUI,
+
+    onApplyDecalFromPose: () => {
+      updatePoseFromPlacementUV();
+      scheduleDecalRebuild();
+      redraw2D();
+    },
+
+    template: uvTemplateImg ? { img: uvTemplateImg } : null,
+    zones,
+    getActiveZoneKey: () => activeZoneKey,
+  });
+
+  return editor;
+}
+
+// --------------------
+// Load GLB (build zones)
+// --------------------
+const loader = new GLTFLoader();
+
+loader.load(
+  '/assets/models/TShirt.glb',
+  async (gltf) => {
+    tshirtRoot = gltf.scene;
+    scene.add(tshirtRoot);
+
+    _modelBox = new THREE.Box3().setFromObject(tshirtRoot);
+    _modelSize = _modelBox.getSize(new THREE.Vector3());
+    _modelCenter = _modelBox.getCenter(new THREE.Vector3());
+    tshirtRoot.position.sub(_modelCenter);
+
+    fitCameraToModel(1.35);
+
+    zones = {};
+    tshirtRoot.traverse(o => {
+      if (!o.isMesh) return;
+      if (o.name === 'PRINT_ZONE_FRONT') zones.front = buildPrintZoneFromMesh(o, 'front');
+      if (o.name === 'PRINT_ZONE_BACK') zones.back = buildPrintZoneFromMesh(o, 'back');
+      if (o.name === 'PRINT_ZONE_LEFT_ARM') zones.left_arm = buildPrintZoneFromMesh(o, 'left_arm');
+      if (o.name === 'PRINT_ZONE_RIGHT_ARM') zones.right_arm = buildPrintZoneFromMesh(o, 'right_arm');
+    });
+
+    console.log('[zones]', zones);
+
+    await initEditorOnce();
+    setActiveZone(activeZoneKey || 'front');
 
     hud.textContent =
-      `Loaded.\n` +
-      `PrintZoneUV: u[${printZone.uMin.toFixed(3)}..${printZone.uMax.toFixed(3)}], v[${printZone.vMin.toFixed(3)}..${printZone.vMax.toFixed(3)}]\n` +
-      `1) Upload image\n2) Click on PRINT_ZONE_FRONT to place\nDrag=move, Wheel=scale, R=rotate\n` +
-      `Snap: Center/Grid (Shift=off)\n` +
-      `Resize: drag corners (Shift=ratio lock, Alt=uniform)\n` +
-      `Overlay rotates with artwork`;
+      'Loaded.\n1) Upload image\n2) Click on active zone in 3D to place\nDrag=move, Wheel=scale, R=rotate';
   },
   undefined,
   (err) => {
@@ -566,15 +626,8 @@ if (zoneMesh && zoneMesh.isObject3D) {
   }
 );
 
-console.log('zoneMesh=', zoneMesh?.name);
-zoneMesh?.traverse(o => {
-  if (o.isMesh) {
-    console.log('child mesh:', o.name, 'hasUV=', !!o.geometry?.attributes?.uv);
-  }
-});
-
 // --------------------
-// Input: place / drag on 3D
+// 3D place / drag
 // --------------------
 canvas.addEventListener('pointerdown', (e) => {
   if (!printZone) return;
@@ -585,12 +638,12 @@ canvas.addEventListener('pointerdown', (e) => {
   if (!hit) return;
 
   if (!isUVInsidePrintZone(hit.uv, printZone)) {
-    hud.textContent = 'Outside PRINT_ZONE_FRONT. Place inside the print zone.';
+    hud.textContent = 'Outside active print zone. Place inside the zone.';
     return;
   }
 
   if (!artworkCtrl.hasImage()) {
-    hud.textContent = 'Upload an image first (right panel).';
+    hud.textContent = 'Upload an image first.';
     return;
   }
 
@@ -598,24 +651,27 @@ canvas.addEventListener('pointerdown', (e) => {
   controls.enabled = false;
 
   artworkCtrl.placeAtUV(hit.uv, printZone);
+  clampPlacementNow(); 
   renderHUD(hit.uv);
 
   const pose = buildPoseFromHit(hit);
   if (!pose) return;
   decalPose = pose;
 
-  syncDecalWHFromPlacement();
   scheduleDecalRebuild();
+  redraw2D();
   btnSubmit && (btnSubmit.disabled = false);
 });
 
 canvas.addEventListener('pointermove', (e) => {
   if (isLocked || !isDragging || resizingCorner) return;
+
   const hit = hitTest(e, camera, zoneMesh, canvas);
   if (!hit) return;
   if (!isUVInsidePrintZone(hit.uv, printZone)) return;
 
   artworkCtrl.placeAtUV(hit.uv, printZone);
+  clampPlacementNow(); 
   renderHUD(hit.uv);
 
   const pose = buildPoseFromHit(hit);
@@ -623,6 +679,7 @@ canvas.addEventListener('pointermove', (e) => {
   decalPose = pose;
 
   scheduleDecalRebuild();
+  redraw2D();
 });
 
 window.addEventListener('pointerup', () => {
@@ -630,81 +687,10 @@ window.addEventListener('pointerup', () => {
   controls.enabled = true;
 });
 
-// === center + fit contain (2D) ============================================
-function centerAndFitOnUpload(img, margin = 0.92) {
-  let p = artworkCtrl.getPlacement() || { u: 0.5, v: 0.5, uScale: 0.3, vScale: 0.3, rotationRad: 0 };
-
-  // 1) Төвд аваачна
-  p.u = 0.5;
-  p.v = 0.5;
-  p.rotationRad = 0;
-
-  // 2) Aspect хадгалсан "fit contain"
-  const ratio = img.height / Math.max(1e-6, img.width);
-  const sMaxByWidth  = margin;
-  const sMaxByHeight = margin / ratio;
-  const best = Math.min(sMaxByWidth, sMaxByHeight);
-
-  p.uScale = Math.min(1.2, Math.max(0.05, best));
-  p.vScale = Math.min(1.2, Math.max(0.05, best * ratio));
-
-  artworkCtrl.setPlacement(p);
-
-  // Upload дараа анхны pose-ийг UV pick-р авч, decal-г throttle-тойгоор байгуулах
-  if (updatePoseFromPlacementUV()) scheduleDecalRebuild();
-
-  // 2D дахин зурах
-  if (editor && typeof editor.drawEditor === 'function') {
-    editor.drawEditor();
-  }
-}
-
-// === AUTO PLACE on 3D (after upload) ======================================
-function autoPlaceOnZoneCenter() {
-  if (!zoneMesh || !printZone) return false;
-  if (!artworkCtrl.hasImage()) return false;
-
-  // Zone world center
-  const box = new THREE.Box3().setFromObject(zoneMesh);
-  const zoneCenterW = box.getCenter(new THREE.Vector3());
-
-  // Ray from camera -> zone center
-  const origin = camera.position.clone();
-  const dir = zoneCenterW.clone().sub(origin).normalize();
-
-  const raycaster = new THREE.Raycaster();
-  raycaster.set(origin, dir);
-
-  const hits = raycaster.intersectObject(zoneMesh, true);
-  if (!hits.length) return false;
-
-  const hit = hits[0];
-  if (!hit.uv) return false;
-
-  artworkCtrl.placeAtUV(hit.uv, printZone);
-
-  const pose = buildPoseFromHit(hit);
-  if (!pose) return false;
-  decalPose = pose;
-
-  syncDecalWHFromPlacement();
-  scheduleDecalRebuild();
-
-  btnSubmit && (btnSubmit.disabled = false);
-  renderHUD(hit.uv);
-
-  if (editor?.drawEditor) editor.drawEditor();
-  if (editor?.updateOverlayBox) editor.updateOverlayBox();
-
-  return true;
-}
-
-// Wheel: resize artwork (edit mode) — 3D canvas талд
+// 3D wheel scale (Alt/Shift only)
 viewer3d.addEventListener('wheel', (e) => {
-  // ✅ Page scroll хэвээр үлдээнэ. Зөвхөн Alt (эсвэл Shift)-тай үед л scale.
   const scaleIntent = e.altKey || e.shiftKey;
   if (!scaleIntent) return;
-
   if (isLocked) return;
   if (!artworkCtrl.hasPlacement()) return;
 
@@ -714,46 +700,61 @@ viewer3d.addEventListener('wheel', (e) => {
   const factor = e.deltaY > 0 ? 0.95 : 1.05;
   artworkCtrl.scaleBy(factor);
   scheduleDecalRebuild();
+  redraw2D();
 }, { passive: false });
 
-
-// Rotate
+// Rotate (R)
 window.addEventListener('keydown', (e) => {
   if (e.key.toLowerCase() === 'r') {
     if (isLocked) return;
     artworkCtrl.rotateByDeg(5);
     scheduleDecalRebuild();
+    redraw2D();
   }
 });
 
+// --------------------
+// Center + fit on upload
+// --------------------
+function centerAndFitOnUpload(img, margin = 0.92) {
+  let p = artworkCtrl.getPlacement() || { u: 0.5, v: 0.5, uScale: 0.3, vScale: 0.3, rotationRad: 0 };
+
+  p.u = 0.5;
+  p.v = 0.5;
+  p.rotationRad = 0;
+
+  const ratio = img.height / Math.max(1e-6, img.width);
+  const sMaxByWidth = margin;
+  const sMaxByHeight = margin / ratio;
+  const best = Math.min(sMaxByWidth, sMaxByHeight);
+
+  p.uScale = Math.min(1.2, Math.max(0.05, best));
+  p.vScale = Math.min(1.2, Math.max(0.05, best * ratio));
+
+  artworkCtrl.setPlacement(p);
+  clampPlacementNow();
+  clampPlacementNow();
+  // pose update (if possible)
+  updatePoseFromPlacementUV();
+  scheduleDecalRebuild();
+  redraw2D();
+}
+
+// --------------------
 // Upload image
+// --------------------
 fileInput?.addEventListener('change', async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
 
   const img = await loadImageFromFile(file);
   artworkCtrl.setImage(img);
-  setArtworkTextureFromImage(img, decalMat, renderer);
 
-  // 2D: төвд багтааж байрлуулах
+  // ✅ mirror fix: flipU true (if your mesh UV causes horizontal mirror)
+  setArtworkTextureFromImage(img, decalMat, renderer, { flipU: true });
+
   centerAndFitOnUpload(img, 0.92);
 
-  // 3D: UV pick -> pose тогтоох, бүтэлгүйдвэл auto place
-  const gotPose = updatePoseFromPlacementUV(); // 2D placement -> UV -> world pose
-  if (gotPose) {
-    scheduleDecalRebuild();
-    hud.textContent = 'Image centered on 2D and posed on 3D (UV pick).';
-  } else {
-    const placed = autoPlaceOnZoneCenter();
-    if (!placed) {
-      hud.textContent = 'Image centered on 2D. Click on PRINT_ZONE_FRONT to place it on 3D.';
-      btnSubmit && (btnSubmit.disabled = true);
-    } else {
-      hud.textContent = 'Image placed on 2D and auto-placed on 3D.';
-    }
-  }
-
-  // (optional) Width(cm) утгыг автоматаар бөглөх
   const p = artworkCtrl.getPlacement();
   if (p && inpWidthCm && printZoneCM?.width) {
     inpWidthCm.value = (printZoneCM.width * p.uScale).toFixed(1);
@@ -761,23 +762,29 @@ fileInput?.addEventListener('change', async (e) => {
 
   setLockedState(false);
   btnEdit && (btnEdit.disabled = true);
+
+  hud.textContent = decalPose
+    ? 'Image centered on 2D and posed on 3D (UV pick).'
+    : 'Image centered on 2D. Click on the active 3D zone to place.';
 });
 
+// --------------------
 // Export
+// --------------------
 btnExport?.addEventListener('click', async () => {
   if (!printZone) return alert('No print zone yet.');
-  if (!artworkCtrl.hasPlacement()) return alert('Place artwork first (click on T-shirt).');
+  if (!artworkCtrl.hasPlacement()) return alert('Place artwork first.');
 
   const placement = artworkCtrl.getPlacement();
-  const product = { id: productKey, side: sideKey };
+  const product = { id: productKey, side: activeZoneKey };
 
   const result = await bakeTemplatePNGAndJSON({
     artworkImage: artworkCtrl.getImage(),
     placement,
     printZone,
     printZoneCM,
-    dpi,
-    templatePx,
+    dpi: DEFAULT_DPI,
+    templatePx: DEFAULT_TEMPLATE_PX,
     product
   });
 
@@ -786,11 +793,13 @@ btnExport?.addEventListener('click', async () => {
   alert('Exported: print-template.png + print-job.json');
 });
 
+// --------------------
 // Animate
+// --------------------
 function animate() {
   requestAnimationFrame(animate);
   updateControls();
   renderer.render(scene, camera);
-  if (editor?.updateOverlayBox) editor.updateOverlayBox();
+  editor?.updateOverlayBox?.();
 }
 animate();
